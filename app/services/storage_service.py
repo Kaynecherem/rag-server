@@ -7,6 +7,7 @@ import shutil
 import structlog
 
 from app.config import get_settings
+from app.utils.retry import retry_async
 
 logger = structlog.get_logger()
 settings = get_settings()
@@ -46,6 +47,7 @@ class StorageService:
 
     # ── Upload ────────────────────────────────────────────────────────────
 
+    @retry_async(max_retries=3, base_delay=1.0)
     async def upload_policy(
         self, tenant_id: str, policy_number: str, file_bytes: bytes, filename: str
     ) -> str:
@@ -62,6 +64,7 @@ class StorageService:
         logger.info("Policy uploaded", key=key, storage="s3" if self.use_s3 else "local")
         return key
 
+    @retry_async(max_retries=3, base_delay=1.0)
     async def upload_communication(
         self, tenant_id: str, doc_id: str, file_bytes: bytes,
         filename: str, content_type: str = "application/pdf"
@@ -81,6 +84,7 @@ class StorageService:
 
     # ── Download ──────────────────────────────────────────────────────────
 
+    @retry_async(max_retries=3, base_delay=1.0)
     async def download_file(self, s3_key: str) -> bytes:
         if self.use_s3:
             response = self.s3.get_object(Bucket=self.bucket, Key=s3_key)

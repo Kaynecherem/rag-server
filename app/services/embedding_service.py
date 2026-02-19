@@ -1,5 +1,6 @@
 """Embedding Service - Generate embeddings via OpenAI API."""
 
+from app.utils.retry import retry_async
 from openai import AsyncOpenAI
 import structlog
 
@@ -17,6 +18,7 @@ class EmbeddingService:
         self.model = settings.embedding_model
         self.dimensions = settings.embedding_dimensions
 
+    @retry_async(max_retries=3, base_delay=1.0)
     async def embed_text(self, text: str) -> list[float]:
         """Generate embedding for a single text string."""
         response = await self.client.embeddings.create(
@@ -26,6 +28,7 @@ class EmbeddingService:
         )
         return response.data[0].embedding
 
+    @retry_async(max_retries=3, base_delay=1.0)
     async def embed_texts(self, texts: list[str]) -> list[list[float]]:
         """Generate embeddings for multiple texts in a batch."""
         if not texts:

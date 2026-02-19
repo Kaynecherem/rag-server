@@ -55,10 +55,11 @@ class Settings(BaseSettings):
     s3_bucket_name: str = "insurance-rag-documents"
 
     # Auth0
-    auth0_domain: str = ""
-    auth0_client_id: str = ""
+    auth0_domain: str = "insurance-rag.us.auth0.com"
+    auth0_client_id: str = "XjUjYKAkzT12uJ6vGhekTZtBUKIOxx0b"
     auth0_client_secret: str = ""
-    auth0_audience: str = ""
+    auth0_audience: str = "https://api.insurance-rag.com"
+    auth0_algorithms: str = "RS256"
 
     # CORS
     cors_origins: str = "http://localhost:3000,http://localhost:8000"
@@ -79,6 +80,16 @@ class Settings(BaseSettings):
         if self.debug:
             return ["*"]  # Allow all origins in development (widget testing)
         return [origin.strip() for origin in self.cors_origins.split(",")]
+
+    @property
+    def auth0_issuer(self) -> str:
+        """Full Auth0 issuer URL."""
+        return f"https://{self.auth0_domain}/"
+
+    @property
+    def auth0_jwks_url(self) -> str:
+        """Auth0 JWKS endpoint for RS256 key verification."""
+        return f"https://{self.auth0_domain}/.well-known/jwks.json"
 
     class Config:
         env_file = ".env"

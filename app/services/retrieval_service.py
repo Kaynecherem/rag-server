@@ -1,5 +1,6 @@
 """Retrieval Service - Vector search against Pinecone with tenant isolation."""
 
+from app.utils.retry import retry_async
 from dataclasses import dataclass
 
 import structlog
@@ -39,6 +40,7 @@ class RetrievalService:
             logger.info("Connected to Pinecone", index=settings.pinecone_index_name)
         return self._index
 
+    @retry_async(max_retries=2, base_delay=1.0)
     async def upsert_chunks(
         self,
         chunks: list[dict],
@@ -80,6 +82,7 @@ class RetrievalService:
             self.index.upsert(vectors=batch, namespace=namespace)
             logger.info("Upserted vectors", batch=i // batch_size + 1, count=len(batch), namespace=namespace)
 
+    @retry_async(max_retries=2, base_delay=0.5)
     async def search_policy(
         self,
         query_embedding: list[float],
@@ -103,6 +106,7 @@ class RetrievalService:
 
         return self._parse_results(results)
 
+    @retry_async(max_retries=2, base_delay=0.5)
     async def search_communications(
         self,
         query_embedding: list[float],

@@ -8,6 +8,7 @@ import structlog
 from app.config import get_settings
 from app.services.embedding_service import EmbeddingService
 from app.services.retrieval_service import RetrievalService, RetrievedChunk
+from app.utils.retry import retry_async
 
 logger = structlog.get_logger()
 settings = get_settings()
@@ -195,6 +196,7 @@ Remember: Only use information from the excerpts above. Cite every fact with [Pa
             logger.error("LLM generation failed", error=str(e), provider=self.provider)
             return "I encountered an error while processing your question. Please try again."
 
+    @retry_async(max_retries=2, base_delay=2.0, max_delay=15.0)
     async def _generate_anthropic(self, system_prompt: str, user_prompt: str) -> str:
         """Generate with Claude."""
         response = await self.llm_client.messages.create(
@@ -206,6 +208,7 @@ Remember: Only use information from the excerpts above. Cite every fact with [Pa
         )
         return response.content[0].text
 
+    @retry_async(max_retries=2, base_delay=2.0, max_delay=15.0)
     async def _generate_openai(self, system_prompt: str, user_prompt: str) -> str:
         """Generate with GPT-4."""
         response = await self.llm_client.chat.completions.create(
