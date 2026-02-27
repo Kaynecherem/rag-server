@@ -294,19 +294,10 @@ async def _process_communication(
 
         if filename.lower().endswith(".pdf"):
             processed = get_processor().process_pdf(file_bytes, filename)
+        elif filename.lower().endswith(".docx"):
+            processed = get_processor().process_docx(file_bytes, filename)
         else:
-            text = file_bytes.decode("utf-8", errors="replace")
-            from app.services.document_processor import Chunk, ProcessedDocument
-            processed = ProcessedDocument(
-                full_text=text,
-                chunks=[Chunk(
-                    chunk_id=str(uuid.uuid4()), chunk_index=0,
-                    text=text, page_number=1, section_title=None,
-                    token_count=len(text.split()),
-                )],
-                page_count=1,
-                metadata={"filename": filename},
-            )
+            processed = get_processor().process_txt(file_bytes, filename)
 
         doc.page_count = processed.page_count
         doc.chunk_count = len(processed.chunks)

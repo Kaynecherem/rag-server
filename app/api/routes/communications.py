@@ -1,6 +1,7 @@
 """Communication Bucket routes - upload, list, delete agency communications."""
 
 import uuid
+from datetime import datetime
 
 from fastapi import APIRouter, Depends, UploadFile, File, Form, HTTPException, Query
 from sqlalchemy import select, func
@@ -84,23 +85,14 @@ async def upload_communication(
         )
         doc.s3_key = s3_key
 
-        # Process (currently only PDF)
-        if file.filename.lower().endswith(".pdf"):
+        # Process based on file type
+        fname = file.filename.lower()
+        if fname.endswith(".pdf"):
             processed = get_processor().process_pdf(file_bytes, file.filename)
+        elif fname.endswith(".docx"):
+            processed = get_processor().process_docx(file_bytes, file.filename)
         else:
-            # For txt/docx, treat full content as single chunk for now
-            text = file_bytes.decode("utf-8", errors="replace")
-            from app.services.document_processor import Chunk, ProcessedDocument
-            processed = ProcessedDocument(
-                full_text=text,
-                chunks=[Chunk(
-                    chunk_id=str(uuid.uuid4()), chunk_index=0,
-                    text=text, page_number=1, section_title=None,
-                    token_count=len(text.split()),
-                )],
-                page_count=1,
-                metadata={"filename": file.filename}
-            )
+            processed = get_processor().process_txt(file_bytes, file.filename)
 
         doc.page_count = processed.page_count
         doc.chunk_count = len(processed.chunks)
@@ -141,7 +133,6 @@ async def upload_communication(
             ))
 
         doc.status = DocumentStatus.INDEXED
-        from datetime import datetime
         doc.processed_at = datetime.utcnow()
 
         logger.info("Communication indexed", doc_id=doc_id, type=communication_type)
@@ -151,6 +142,8 @@ async def upload_communication(
         doc.error_message = str(e)
         logger.error("Communication processing failed", error=str(e))
         raise HTTPException(status_code=500, detail=f"Processing failed: {str(e)}")
+
+    await db.commit()
 
     return CommunicationUploadResponse(
         doc_id=doc_id,
@@ -163,30 +156,32 @@ async def upload_communication(
 @router.get("", response_model=CommunicationListResponse)
 async def list_communications(
     communication_type: str | None = Query(None),
+    search: str | None = Query(None),
     page: int = Query(1, ge=1),
     page_size: int = Query(20, ge=1, le=100),
     db: AsyncSession = Depends(get_db),
     staff: dict = Depends(require_staff),
     tenant_id: str = Depends(get_tenant_id),
 ):
-    """List agency communications with optional type filter."""
-    query = select(Document).where(
+    """List agency communications with optional type filter and search."""
+    base_filter = [
         Document.tenant_id == tenant_id,
         Document.document_type == DocumentType.COMMUNICATION,
-    )
-    count_query = select(func.count(Document.id)).where(
-        Document.tenant_id == tenant_id,
-        Document.document_type == DocumentType.COMMUNICATION,
-    )
+    ]
 
     if communication_type:
-        query = query.where(Document.communication_type == communication_type)
-        count_query = count_query.where(Document.communication_type == communication_type)
+        base_filter.append(Document.communication_type == communication_type)
 
-    # Total count
+    if search:
+        base_filter.append(
+            Document.title.ilike(f"%{search}%") | Document.filename.ilike(f"%{search}%")
+        )
+
+    query = select(Document).where(*base_filter)
+    count_query = select(func.count(Document.id)).where(*base_filter)
+
     total = (await db.execute(count_query)).scalar()
 
-    # Paginated results
     query = query.order_by(Document.created_at.desc())
     query = query.offset((page - 1) * page_size).limit(page_size)
     result = await db.execute(query)
@@ -230,18 +225,31 @@ async def delete_communication(
     if not doc:
         raise HTTPException(status_code=404, detail="Communication not found")
 
-    # Delete vectors
-    chunks_result = await db.execute(
-        select(DocumentChunk.pinecone_id).where(DocumentChunk.document_id == doc.id)
+    # Delete chunks from Pinecone
+    chunk_result = await db.execute(
+        select(DocumentChunk).where(DocumentChunk.document_id == doc.id)
     )
-    chunk_ids = [row[0] for row in chunks_result.all() if row[0]]
+    chunks = chunk_result.scalars().all()
+    chunk_ids = [c.pinecone_id for c in chunks if c.pinecone_id]
+
     if chunk_ids:
-        await get_retrieval_service().delete_document_vectors(tenant_id, chunk_ids)
+        try:
+            await get_retrieval_service().delete_document_vectors(tenant_id, chunk_ids)
+        except Exception as e:
+            logger.warning("Failed to delete vectors", error=str(e))
 
     # Delete from S3
-    await get_storage().delete_communication(tenant_id, doc_id)
+    try:
+        from app.services.storage_service import StorageService
+        storage = StorageService()
+        await storage.delete_communication(tenant_id, doc_id)
+    except Exception as e:
+        logger.warning("Failed to delete from storage", error=str(e))
 
-    # Delete from DB
+    # Delete DB records
+    for chunk in chunks:
+        await db.delete(chunk)
     await db.delete(doc)
+    await db.commit()
 
-    return {"doc_id": doc_id, "deleted": True}
+    return {"status": "deleted", "doc_id": doc_id}

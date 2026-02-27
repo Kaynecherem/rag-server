@@ -2,8 +2,8 @@
 
 import uuid
 
-from fastapi import APIRouter, Depends, UploadFile, File, Form, HTTPException
-from sqlalchemy import select
+from fastapi import APIRouter, Depends, UploadFile, File, Form, HTTPException, Response, Query
+from sqlalchemy import select, func
 from sqlalchemy.ext.asyncio import AsyncSession
 
 import structlog
@@ -246,3 +246,151 @@ async def check_policy_available(
         indexed_at=doc.processed_at if doc else None,
         chunk_count=doc.chunk_count if doc else None,
     )
+
+# ── Append these endpoints ──
+
+@router.get("/search")
+async def search_policies(
+    q: str = Query("", min_length=0),
+    page: int = Query(1, ge=1),
+    page_size: int = Query(20, ge=1, le=100),
+    db: AsyncSession = Depends(get_db),
+    staff: dict = Depends(require_staff),
+    tenant_id: str = Depends(get_tenant_id),
+):
+    """Search policies by policy number or filename. Returns matching policies."""
+    from sqlalchemy import or_
+
+    base_filter = [
+        Document.tenant_id == tenant_id,
+        Document.document_type == DocumentType.POLICY,
+    ]
+
+    if q.strip():
+        base_filter.append(
+            or_(
+                Document.policy_number.ilike(f"%{q}%"),
+                Document.filename.ilike(f"%{q}%"),
+                Document.title.ilike(f"%{q}%"),
+            )
+        )
+
+    query = select(Document).where(*base_filter)
+    count_query = select(func.count(Document.id)).where(*base_filter)
+
+    total = (await db.execute(count_query)).scalar()
+
+    query = query.order_by(Document.created_at.desc())
+    query = query.offset((page - 1) * page_size).limit(page_size)
+    result = await db.execute(query)
+    docs = result.scalars().all()
+
+    return {
+        "policies": [
+            {
+                "policy_number": doc.policy_number,
+                "filename": doc.filename,
+                "title": doc.title,
+                "status": doc.status.value,
+                "page_count": doc.page_count,
+                "chunk_count": doc.chunk_count,
+                "created_at": doc.created_at.isoformat() if doc.created_at else None,
+            }
+            for doc in docs
+        ],
+        "total": total,
+        "page": page,
+        "page_size": page_size,
+    }
+
+
+@router.get("/{policy_number}/download")
+async def download_policy(
+    policy_number: str,
+    db: AsyncSession = Depends(get_db),
+    user: dict = Depends(get_current_user),
+    tenant_id: str = Depends(get_tenant_id),
+):
+    """Download the original policy PDF."""
+    from fastapi.responses import Response
+
+    # Policyholders can only download their own policy
+    if user.get("role") == "policyholder":
+        if user.get("sub") != policy_number:
+            raise HTTPException(status_code=403, detail="Access denied to this policy")
+
+    result = await db.execute(
+        select(Document).where(
+            Document.policy_number == policy_number,
+            Document.tenant_id == tenant_id,
+            Document.document_type == DocumentType.POLICY,
+        )
+    )
+    doc = result.scalar_one_or_none()
+    if not doc:
+        raise HTTPException(status_code=404, detail="Policy not found")
+
+    try:
+        storage = get_storage()
+        file_bytes = await storage.download_file(doc.s3_key)
+    except Exception as e:
+        logger.error("Download failed", error=str(e))
+        raise HTTPException(status_code=500, detail="Failed to retrieve policy file")
+
+    return Response(
+        content=file_bytes,
+        media_type="application/pdf",
+        headers={
+            "Content-Disposition": f'attachment; filename="{doc.filename}"',
+        },
+    )
+
+
+@router.get("/{policy_number}/text")
+async def get_policy_text(
+    policy_number: str,
+    db: AsyncSession = Depends(get_db),
+    user: dict = Depends(get_current_user),
+    tenant_id: str = Depends(get_tenant_id),
+):
+    """Get the extracted text of a policy (for in-browser reading)."""
+
+    # Policyholders can only read their own policy
+    if user.get("role") == "policyholder":
+        if user.get("sub") != policy_number:
+            raise HTTPException(status_code=403, detail="Access denied to this policy")
+
+    result = await db.execute(
+        select(Document).where(
+            Document.policy_number == policy_number,
+            Document.tenant_id == tenant_id,
+            Document.document_type == DocumentType.POLICY,
+        )
+    )
+    doc = result.scalar_one_or_none()
+    if not doc:
+        raise HTTPException(status_code=404, detail="Policy not found")
+
+    # Get all chunks ordered by index to reconstruct the text
+    from sqlalchemy import asc
+    chunk_result = await db.execute(
+        select(DocumentChunk)
+        .where(DocumentChunk.document_id == doc.id)
+        .order_by(asc(DocumentChunk.chunk_index))
+    )
+    chunks = chunk_result.scalars().all()
+
+    sections = []
+    for chunk in chunks:
+        sections.append({
+            "page": chunk.page_number,
+            "section": chunk.section_title,
+            "text": chunk.chunk_text,
+        })
+
+    return {
+        "policy_number": policy_number,
+        "filename": doc.filename,
+        "page_count": doc.page_count,
+        "sections": sections,
+    }

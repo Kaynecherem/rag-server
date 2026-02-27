@@ -1,5 +1,6 @@
-"""Document Processing Service - PDF text extraction and intelligent chunking."""
+"""Document Processing Service - PDF text extraction, OCR fallback, DOCX support, and intelligent chunking."""
 
+import io
 import re
 import uuid
 from dataclasses import dataclass
@@ -12,6 +13,11 @@ from app.config import get_settings
 
 logger = structlog.get_logger()
 settings = get_settings()
+
+
+# Minimum chars per page to consider text extraction successful.
+# Below this threshold, we assume the page is scanned/image-based and try OCR.
+OCR_THRESHOLD = 30
 
 
 @dataclass
@@ -27,7 +33,7 @@ class Chunk:
 
 @dataclass
 class ProcessedDocument:
-    """Result of processing a PDF document."""
+    """Result of processing a document."""
     full_text: str
     chunks: list[Chunk]
     page_count: int
@@ -35,12 +41,14 @@ class ProcessedDocument:
 
 
 class DocumentProcessor:
-    """Processes PDF documents: extracts text, chunks intelligently."""
+    """Processes PDF and DOCX documents: extracts text, chunks intelligently."""
 
     def __init__(self):
         self.tokenizer = tiktoken.get_encoding("cl100k_base")
         self.chunk_size = settings.chunk_size
         self.chunk_overlap = settings.chunk_overlap
+
+    # ── Public API ─────────────────────────────────────────────────────────
 
     def process_pdf(self, pdf_bytes: bytes, filename: str = "") -> ProcessedDocument:
         """
@@ -48,28 +56,52 @@ class DocumentProcessor:
 
         Pipeline:
         1. Extract text with page mapping (PyMuPDF)
-        2. Detect section headers from layout
-        3. Chunk by sections (primary) or sliding window (fallback)
-        4. Return structured chunks with metadata
+        2. For pages with no/little text, run Tesseract OCR
+        3. Detect section headers from layout
+        4. Chunk by sections (primary) or sliding window (fallback)
+        5. Return structured chunks with metadata
         """
         logger.info("Processing PDF", filename=filename, size_bytes=len(pdf_bytes))
 
-        # Step 1: Extract text with page mapping
-        pages = self._extract_pages(pdf_bytes)
+        # Step 1 + 2: Extract text with OCR fallback
+        pages, ocr_pages = self._extract_pages(pdf_bytes)
         full_text = "\n\n".join(page["text"] for page in pages)
         page_count = len(pages)
 
-        logger.info("Text extracted", pages=page_count, chars=len(full_text))
+        logger.info(
+            "Text extracted",
+            pages=page_count,
+            chars=len(full_text),
+            ocr_pages=ocr_pages,
+        )
 
-        # Step 2: Detect sections
+        if not full_text.strip():
+            logger.warning("No text extracted from PDF", filename=filename)
+            return ProcessedDocument(
+                full_text="",
+                chunks=[],
+                page_count=page_count,
+                metadata={
+                    "filename": filename,
+                    "page_count": page_count,
+                    "chunk_count": 0,
+                    "chunking_method": "none",
+                    "ocr_pages": ocr_pages,
+                    "warning": "No extractable text found",
+                },
+            )
+
+        # Step 3: Detect sections
         sections = self._detect_sections(pages)
 
-        # Step 3: Chunk
+        # Step 4: Chunk
         if sections and len(sections) > 1:
             chunks = self._chunk_by_sections(sections)
+            method = "section"
             logger.info("Chunked by sections", chunk_count=len(chunks), section_count=len(sections))
         else:
             chunks = self._chunk_sliding_window(pages)
+            method = "sliding_window"
             logger.info("Chunked by sliding window", chunk_count=len(chunks))
 
         return ProcessedDocument(
@@ -80,32 +112,183 @@ class DocumentProcessor:
                 "filename": filename,
                 "page_count": page_count,
                 "chunk_count": len(chunks),
-                "chunking_method": "section" if (sections and len(sections) > 1) else "sliding_window",
-            }
+                "chunking_method": method,
+                "ocr_pages": ocr_pages,
+            },
         )
 
-    def _extract_pages(self, pdf_bytes: bytes) -> list[dict]:
-        """Extract text from each page with layout preservation."""
+    def process_docx(self, docx_bytes: bytes, filename: str = "") -> ProcessedDocument:
+        """
+        Extract text from a DOCX file and chunk it.
+
+        Uses python-docx to extract paragraphs and tables.
+        """
+        logger.info("Processing DOCX", filename=filename, size_bytes=len(docx_bytes))
+
+        try:
+            from docx import Document as DocxDocument
+
+            doc = DocxDocument(io.BytesIO(docx_bytes))
+
+            paragraphs = []
+            for para in doc.paragraphs:
+                text = para.text.strip()
+                if text:
+                    paragraphs.append(text)
+
+            # Also extract text from tables
+            for table in doc.tables:
+                for row in table.rows:
+                    row_text = " | ".join(
+                        cell.text.strip() for cell in row.cells if cell.text.strip()
+                    )
+                    if row_text:
+                        paragraphs.append(row_text)
+
+            full_text = "\n\n".join(paragraphs)
+
+        except ImportError:
+            logger.warning("python-docx not installed, falling back to raw decode")
+            full_text = docx_bytes.decode("utf-8", errors="replace")
+        except Exception as e:
+            logger.error("DOCX extraction failed", error=str(e))
+            full_text = docx_bytes.decode("utf-8", errors="replace")
+
+        if not full_text.strip():
+            return ProcessedDocument(
+                full_text="", chunks=[], page_count=1,
+                metadata={"filename": filename, "warning": "No text extracted"},
+            )
+
+        # Chunk the full text
+        chunks = self._split_text(full_text, page_number=1, section_title=None, start_index=0)
+
+        logger.info("DOCX processed", chunks=len(chunks), chars=len(full_text))
+
+        return ProcessedDocument(
+            full_text=full_text,
+            chunks=chunks,
+            page_count=1,
+            metadata={
+                "filename": filename,
+                "page_count": 1,
+                "chunk_count": len(chunks),
+                "chunking_method": "sliding_window",
+            },
+        )
+
+    def process_txt(self, text_bytes: bytes, filename: str = "") -> ProcessedDocument:
+        """Process a plain text file."""
+        text = text_bytes.decode("utf-8", errors="replace").strip()
+
+        if not text:
+            return ProcessedDocument(
+                full_text="", chunks=[], page_count=1,
+                metadata={"filename": filename, "warning": "Empty file"},
+            )
+
+        chunks = self._split_text(text, page_number=1, section_title=None, start_index=0)
+
+        return ProcessedDocument(
+            full_text=text,
+            chunks=chunks,
+            page_count=1,
+            metadata={
+                "filename": filename,
+                "page_count": 1,
+                "chunk_count": len(chunks),
+                "chunking_method": "sliding_window",
+            },
+        )
+
+    # ── PDF Extraction ─────────────────────────────────────────────────────
+
+    def _extract_pages(self, pdf_bytes: bytes) -> tuple[list[dict], int]:
+        """
+        Extract text from each page. Falls back to Tesseract OCR for
+        pages with little or no text (scanned documents).
+
+        Returns (pages, ocr_page_count).
+        """
         pages = []
+        ocr_pages = 0
+
         try:
             doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+
             for page_num, page in enumerate(doc, 1):
-                text = page.get_text("text")
-                if not text.strip():
-                    # Fallback: try OCR-friendly extraction
-                    text = page.get_text("blocks")
-                    text = "\n".join(block[4] for block in text if block[6] == 0)
+                # First try native text extraction
+                text = page.get_text("text").strip()
+
+                if len(text) < OCR_THRESHOLD:
+                    # Page likely scanned — try OCR
+                    ocr_text = self._ocr_page(page, page_num)
+                    if ocr_text and len(ocr_text) > len(text):
+                        text = ocr_text
+                        ocr_pages += 1
 
                 pages.append({
                     "page_number": page_num,
-                    "text": text.strip(),
+                    "text": text,
                 })
+
             doc.close()
+
         except Exception as e:
             logger.error("PDF extraction failed", error=str(e))
             raise
 
-        return pages
+        return pages, ocr_pages
+
+    def _ocr_page(self, page, page_num: int) -> str:
+        """
+        Run Tesseract OCR on a single PDF page.
+
+        Renders the page to an image, then uses pytesseract to extract text.
+        Returns empty string if OCR is unavailable or fails.
+        """
+        try:
+            import pytesseract
+            from PIL import Image
+
+            # Render page to image at 300 DPI for good OCR quality
+            # Use a zoom factor: 300/72 ≈ 4.17
+            zoom = 300 / 72
+            matrix = fitz.Matrix(zoom, zoom)
+            pix = page.get_pixmap(matrix=matrix, alpha=False)
+
+            # Convert to PIL Image
+            img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+
+            # Run Tesseract OCR
+            text = pytesseract.image_to_string(img, lang="eng")
+            text = text.strip()
+
+            if text:
+                logger.info(
+                    "OCR extracted text",
+                    page=page_num,
+                    chars=len(text),
+                )
+
+            return text
+
+        except ImportError:
+            logger.warning(
+                "pytesseract not available, skipping OCR",
+                page=page_num,
+            )
+            return ""
+
+        except Exception as e:
+            logger.warning(
+                "OCR failed for page",
+                page=page_num,
+                error=str(e),
+            )
+            return ""
+
+    # ── Section Detection ──────────────────────────────────────────────────
 
     def _detect_sections(self, pages: list[dict]) -> list[dict]:
         """
@@ -115,13 +298,12 @@ class DocumentProcessor:
         sections = []
         current_section = {"title": "Document Start", "text": "", "page_number": 1}
 
-        # Patterns for section headers
         header_patterns = [
             r"^[A-Z][A-Z\s\-]{5,}$",              # ALL CAPS lines (5+ chars)
             r"^(?:SECTION|ARTICLE|PART)\s+\d+",     # SECTION 1, ARTICLE 2, etc.
             r"^\d+\.\s+[A-Z]",                       # 1. Title format
             r"^[IVXLC]+\.\s+",                       # Roman numeral sections
-            r"^(?:COVERAGE|EXCLUSION|CONDITION|DEFINITION|ENDORSEMENT)", # Insurance-specific
+            r"^(?:COVERAGE|EXCLUSION|CONDITION|DEFINITION|ENDORSEMENT)",
         ]
 
         for page in pages:
@@ -134,7 +316,6 @@ class DocumentProcessor:
                 is_header = any(re.match(pattern, line_stripped) for pattern in header_patterns)
 
                 if is_header and len(line_stripped) < 100:
-                    # Save current section and start new one
                     if current_section["text"].strip():
                         sections.append(current_section)
                     current_section = {
@@ -145,11 +326,12 @@ class DocumentProcessor:
                 else:
                     current_section["text"] += line + "\n"
 
-        # Don't forget the last section
         if current_section["text"].strip():
             sections.append(current_section)
 
         return sections
+
+    # ── Chunking ───────────────────────────────────────────────────────────
 
     def _chunk_by_sections(self, sections: list[dict]) -> list[Chunk]:
         """Chunk by detected sections. Split large sections with sliding window."""
@@ -161,7 +343,6 @@ class DocumentProcessor:
             token_count = len(self.tokenizer.encode(text))
 
             if token_count <= self.chunk_size:
-                # Section fits in one chunk
                 chunks.append(Chunk(
                     chunk_id=str(uuid.uuid4()),
                     chunk_index=chunk_index,
@@ -172,7 +353,6 @@ class DocumentProcessor:
                 ))
                 chunk_index += 1
             else:
-                # Section too large, split with sliding window
                 sub_chunks = self._split_text(
                     text,
                     page_number=section["page_number"],

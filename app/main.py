@@ -18,7 +18,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.config import get_settings
-from app.api.routes import policies, communications, query, auth, widget
+from app.api.routes import policies, communications, query, auth, widget, batch_upload, history
 from app.db.session import engine, Base
 
 # ── Hardening imports ────────────────────────────────────────────────
@@ -27,6 +27,7 @@ from app.middleware.request_id import RequestIDMiddleware
 from app.middleware.logging_mw import RequestLoggingMiddleware
 from app.middleware.rate_limit import RateLimitMiddleware
 from app.middleware.error_handler import register_exception_handlers
+
 
 settings = get_settings()
 
@@ -100,7 +101,8 @@ app.include_router(policies.router, prefix="/api/v1/policies", tags=["policies"]
 app.include_router(communications.router, prefix="/api/v1/communications", tags=["communications"])
 app.include_router(query.router, prefix="/api/v1", tags=["query"])
 app.include_router(widget.router, prefix="/widget", tags=["widget"])
-
+app.include_router(batch_upload.router, prefix="/api/v1", tags=["batch-upload"])
+app.include_router(history.router, prefix="/api/v1/history", tags=["history"])
 
 # ── Health Check ─────────────────────────────────────────────────────
 
