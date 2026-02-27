@@ -151,6 +151,7 @@ async def upload_policy(
         await get_retrieval_service().upsert_chunks(
             chunks=chunks_for_pinecone,
             tenant_id=tenant_id,
+            document_type="policy",
             policy_number=policy_number,
         )
 
