@@ -1,16 +1,16 @@
-"""Policy management routes - upload, status tracking, deletion."""
+"""Policy management routes - upload, status tracking, deletion, download, search."""
 
 import uuid
 
-from fastapi import APIRouter, Depends, UploadFile, File, Form, HTTPException, Response, Query
-from sqlalchemy import select, func
+from fastapi import APIRouter, Depends, UploadFile, File, Form, HTTPException, Query, Response
+from sqlalchemy import select, func, or_, asc
 from sqlalchemy.ext.asyncio import AsyncSession
 
 import structlog
 
 from app.db.session import get_db
 from app.api.dependencies import require_staff, get_tenant_id, get_current_user
-from app.models.database import Document, DocumentType, DocumentStatus
+from app.models.database import Document, DocumentType, DocumentStatus, DocumentChunk
 from app.models.schemas import (
     PolicyUploadResponse, PolicyStatusResponse,
     PolicyDeleteResponse, PolicyAvailableResponse,
@@ -37,217 +37,7 @@ def get_retrieval_service():
     return RetrievalService()
 
 
-@router.post("/upload", response_model=PolicyUploadResponse)
-async def upload_policy(
-    file: UploadFile = File(...),
-    policy_number: str = Form(...),
-    db: AsyncSession = Depends(get_db),
-    staff: dict = Depends(require_staff),
-    tenant_id: str = Depends(get_tenant_id),
-):
-    """
-    Upload a policy PDF for processing and indexing.
-
-    In production, processing would be async via Celery.
-    For MVP, we process synchronously.
-    """
-    # Validate file
-    if not file.filename.lower().endswith(".pdf"):
-        raise HTTPException(status_code=400, detail="Only PDF files are supported")
-
-    file_bytes = await file.read()
-    if len(file_bytes) > 50 * 1024 * 1024:  # 50MB limit
-        raise HTTPException(status_code=400, detail="File size exceeds 50MB limit")
-
-    job_id = f"job_{uuid.uuid4().hex[:12]}"
-
-    # Create document record
-    doc = Document(
-        tenant_id=tenant_id,
-        document_type=DocumentType.POLICY,
-        status=DocumentStatus.PROCESSING,
-        policy_number=policy_number,
-        filename=file.filename,
-        s3_key="",  # Will be set after upload
-        file_size_bytes=len(file_bytes),
-        job_id=job_id,
-    )
-    db.add(doc)
-    await db.flush()
-
-    try:
-        # Step 1: Upload to S3
-        s3_key = await get_storage().upload_policy(tenant_id, policy_number, file_bytes, file.filename)
-        doc.s3_key = s3_key
-
-        # Step 2: Extract text and chunk
-        processed = get_processor().process_pdf(file_bytes, file.filename)
-        doc.page_count = processed.page_count
-        doc.chunk_count = len(processed.chunks)
-
-        # Step 3: Generate embeddings
-        chunk_texts = [c.text for c in processed.chunks]
-        embeddings = await get_embedding_service().embed_texts(chunk_texts)
-
-        # Step 4: Store in Pinecone
-        chunks_for_pinecone = [
-            {
-                "chunk_id": c.chunk_id,
-                "text": c.text,
-                "embedding": emb,
-                "page_number": c.page_number,
-                "section_title": c.section_title,
-                "chunk_index": c.chunk_index,
-            }
-            for c, emb in zip(processed.chunks, embeddings)
-        ]
-
-        await get_retrieval_service().upsert_chunks(
-            chunks=chunks_for_pinecone,
-            tenant_id=tenant_id,
-            document_type="policy",
-            policy_number=policy_number,
-        )
-
-        # Step 5: Save chunk records in DB
-        from app.models.database import DocumentChunk
-        for chunk in processed.chunks:
-            db_chunk = DocumentChunk(
-                document_id=doc.id,
-                chunk_index=chunk.chunk_index,
-                chunk_text=chunk.text,
-                page_number=chunk.page_number,
-                section_title=chunk.section_title,
-                token_count=chunk.token_count,
-                pinecone_id=chunk.chunk_id,
-            )
-            db.add(db_chunk)
-
-        doc.status = DocumentStatus.INDEXED
-        from datetime import datetime
-        doc.processed_at = datetime.utcnow()
-
-        logger.info(
-            "Policy indexed successfully",
-            policy_number=policy_number,
-            pages=processed.page_count,
-            chunks=len(processed.chunks),
-        )
-
-    except Exception as e:
-        doc.status = DocumentStatus.FAILED
-        doc.error_message = str(e)
-        logger.error("Policy processing failed", error=str(e), policy_number=policy_number)
-        raise HTTPException(status_code=500, detail=f"Processing failed: {str(e)}")
-
-    return PolicyUploadResponse(
-        job_id=job_id,
-        status=doc.status.value,
-        policy_number=policy_number,
-    )
-
-
-@router.get("/upload/{job_id}", response_model=PolicyStatusResponse)
-async def get_upload_status(
-    job_id: str,
-    db: AsyncSession = Depends(get_db),
-    staff: dict = Depends(require_staff),
-    tenant_id: str = Depends(get_tenant_id),
-):
-    """Check the processing status of a policy upload job."""
-    result = await db.execute(
-        select(Document).where(
-            Document.job_id == job_id,
-            Document.tenant_id == tenant_id,
-        )
-    )
-    doc = result.scalar_one_or_none()
-    if not doc:
-        raise HTTPException(status_code=404, detail="Job not found")
-
-    return PolicyStatusResponse(
-        job_id=job_id,
-        status=doc.status.value,
-        policy_number=doc.policy_number,
-        page_count=doc.page_count,
-        chunk_count=doc.chunk_count,
-        error=doc.error_message,
-    )
-
-
-@router.delete("/{policy_number}", response_model=PolicyDeleteResponse)
-async def delete_policy(
-    policy_number: str,
-    db: AsyncSession = Depends(get_db),
-    staff: dict = Depends(require_staff),
-    tenant_id: str = Depends(get_tenant_id),
-):
-    """Delete a policy and all associated data (S3, Pinecone, DB)."""
-    result = await db.execute(
-        select(Document).where(
-            Document.policy_number == policy_number,
-            Document.tenant_id == tenant_id,
-            Document.document_type == DocumentType.POLICY,
-        )
-    )
-    doc = result.scalar_one_or_none()
-    if not doc:
-        raise HTTPException(status_code=404, detail="Policy not found")
-
-    # Delete from Pinecone
-    from app.models.database import DocumentChunk
-    chunks_result = await db.execute(
-        select(DocumentChunk.pinecone_id).where(DocumentChunk.document_id == doc.id)
-    )
-    chunk_ids = [row[0] for row in chunks_result.all() if row[0]]
-    if chunk_ids:
-        await get_retrieval_service().delete_document_vectors(tenant_id, chunk_ids)
-
-    # Delete from S3
-    await get_storage().delete_policy(tenant_id, policy_number)
-
-    # Delete from DB (cascades to chunks)
-    await db.delete(doc)
-
-    logger.info("Policy deleted", policy_number=policy_number, tenant_id=tenant_id)
-
-    return PolicyDeleteResponse(
-        policy_number=policy_number,
-        deleted=True,
-        message="Policy and all associated data deleted successfully",
-    )
-
-
-@router.get("/{policy_number}/available", response_model=PolicyAvailableResponse)
-async def check_policy_available(
-    policy_number: str,
-    db: AsyncSession = Depends(get_db),
-    current_user: dict = Depends(get_current_user),
-    tenant_id: str = Depends(get_tenant_id),
-):
-    """Check if a policy is indexed and available for querying."""
-    # Policyholders can only check their own policy
-    if current_user.get("role") == "policyholder":
-        if current_user.get("sub") != policy_number:
-            raise HTTPException(status_code=403, detail="Access denied to this policy")
-
-    result = await db.execute(
-        select(Document).where(
-            Document.policy_number == policy_number,
-            Document.tenant_id == tenant_id,
-            Document.document_type == DocumentType.POLICY,
-        )
-    )
-    doc = result.scalar_one_or_none()
-
-    return PolicyAvailableResponse(
-        available=doc is not None and doc.status == DocumentStatus.INDEXED,
-        policy_number=policy_number,
-        indexed_at=doc.processed_at if doc else None,
-        chunk_count=doc.chunk_count if doc else None,
-    )
-
-# ── Append these endpoints ──
+# ── Search (must come BEFORE /{policy_number} routes) ────────────────
 
 @router.get("/search")
 async def search_policies(
@@ -258,9 +48,7 @@ async def search_policies(
     staff: dict = Depends(require_staff),
     tenant_id: str = Depends(get_tenant_id),
 ):
-    """Search policies by policy number or filename. Returns matching policies."""
-    from sqlalchemy import or_
-
+    """Search policies by policy number, filename, or title."""
     base_filter = [
         Document.tenant_id == tenant_id,
         Document.document_type == DocumentType.POLICY,
@@ -304,6 +92,139 @@ async def search_policies(
     }
 
 
+# ── Upload ───────────────────────────────────────────────────────────
+
+@router.post("/upload", response_model=PolicyUploadResponse)
+async def upload_policy(
+    file: UploadFile = File(...),
+    policy_number: str = Form(...),
+    db: AsyncSession = Depends(get_db),
+    staff: dict = Depends(require_staff),
+    tenant_id: str = Depends(get_tenant_id),
+):
+    """Upload a policy PDF for processing and indexing."""
+    if not file.filename.lower().endswith(".pdf"):
+        raise HTTPException(status_code=400, detail="Only PDF files are supported")
+
+    file_bytes = await file.read()
+    if len(file_bytes) > 50 * 1024 * 1024:
+        raise HTTPException(status_code=400, detail="File size exceeds 50MB limit")
+
+    job_id = f"job_{uuid.uuid4().hex[:12]}"
+
+    doc = Document(
+        tenant_id=tenant_id,
+        document_type=DocumentType.POLICY,
+        status=DocumentStatus.PROCESSING,
+        policy_number=policy_number,
+        filename=file.filename,
+        s3_key="",
+        file_size_bytes=len(file_bytes),
+        job_id=job_id,
+    )
+    db.add(doc)
+    await db.flush()
+
+    try:
+        s3_key = await get_storage().upload_policy(tenant_id, policy_number, file_bytes, file.filename)
+        doc.s3_key = s3_key
+
+        processed = get_processor().process_pdf(file_bytes, file.filename)
+        doc.page_count = processed.page_count
+        doc.chunk_count = len(processed.chunks)
+
+        chunk_texts = [c.text for c in processed.chunks]
+        embeddings = await get_embedding_service().embed_texts(chunk_texts)
+
+        chunks_for_pinecone = [
+            {
+                "chunk_id": c.chunk_id,
+                "text": c.text,
+                "embedding": emb,
+                "page_number": c.page_number,
+                "section_title": c.section_title,
+                "chunk_index": c.chunk_index,
+            }
+            for c, emb in zip(processed.chunks, embeddings)
+        ]
+
+        await get_retrieval_service().upsert_chunks(
+            chunks=chunks_for_pinecone,
+            tenant_id=tenant_id,
+            policy_number=policy_number,
+        )
+
+        for chunk in processed.chunks:
+            db.add(DocumentChunk(
+                document_id=doc.id,
+                chunk_index=chunk.chunk_index,
+                chunk_text=chunk.text,
+                page_number=chunk.page_number,
+                section_title=chunk.section_title,
+                token_count=chunk.token_count,
+                pinecone_id=chunk.chunk_id,
+            ))
+
+        doc.status = DocumentStatus.INDEXED
+        from datetime import datetime
+        doc.processed_at = datetime.utcnow()
+
+        logger.info("Policy indexed",
+            policy_number=policy_number,
+            chunks=len(processed.chunks),
+            pages=processed.page_count,
+        )
+
+    except Exception as e:
+        doc.status = DocumentStatus.FAILED
+        doc.error_message = str(e)
+        logger.error("Policy processing failed", error=str(e))
+        raise HTTPException(status_code=500, detail=f"Processing failed: {str(e)}")
+
+    await db.commit()
+
+    return PolicyUploadResponse(
+        job_id=job_id,
+        policy_number=policy_number,
+        status=doc.status.value,
+        page_count=doc.page_count,
+        chunk_count=doc.chunk_count,
+    )
+
+
+# ── Status & Availability ───────────────────────────────────────────
+
+@router.get("/{policy_number}/available", response_model=PolicyAvailableResponse)
+async def check_policy_available(
+    policy_number: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
+    tenant_id: str = Depends(get_tenant_id),
+):
+    """Check if a policy has been indexed and is available for queries."""
+    if current_user.get("role") == "policyholder":
+        if current_user.get("sub") != policy_number:
+            raise HTTPException(status_code=403, detail="Access denied to this policy")
+
+    result = await db.execute(
+        select(Document).where(
+            Document.policy_number == policy_number,
+            Document.tenant_id == tenant_id,
+            Document.document_type == DocumentType.POLICY,
+        )
+    )
+    doc = result.scalar_one_or_none()
+
+    return PolicyAvailableResponse(
+        available=doc is not None and doc.status == DocumentStatus.INDEXED,
+        policy_number=policy_number,
+        indexed_at=doc.processed_at if doc else None,
+        chunk_count=doc.chunk_count if doc else None,
+    )
+
+
+# ── Download & Text ─────────────────────────────────────────────────
+
 @router.get("/{policy_number}/download")
 async def download_policy(
     policy_number: str,
@@ -312,9 +233,6 @@ async def download_policy(
     tenant_id: str = Depends(get_tenant_id),
 ):
     """Download the original policy PDF."""
-    from fastapi.responses import Response
-
-    # Policyholders can only download their own policy
     if user.get("role") == "policyholder":
         if user.get("sub") != policy_number:
             raise HTTPException(status_code=403, detail="Access denied to this policy")
@@ -354,8 +272,6 @@ async def get_policy_text(
     tenant_id: str = Depends(get_tenant_id),
 ):
     """Get the extracted text of a policy (for in-browser reading)."""
-
-    # Policyholders can only read their own policy
     if user.get("role") == "policyholder":
         if user.get("sub") != policy_number:
             raise HTTPException(status_code=403, detail="Access denied to this policy")
@@ -371,8 +287,6 @@ async def get_policy_text(
     if not doc:
         raise HTTPException(status_code=404, detail="Policy not found")
 
-    # Get all chunks ordered by index to reconstruct the text
-    from sqlalchemy import asc
     chunk_result = await db.execute(
         select(DocumentChunk)
         .where(DocumentChunk.document_id == doc.id)
@@ -394,3 +308,55 @@ async def get_policy_text(
         "page_count": doc.page_count,
         "sections": sections,
     }
+
+
+# ── Delete ───────────────────────────────────────────────────────────
+
+@router.delete("/{policy_number}", response_model=PolicyDeleteResponse)
+async def delete_policy_endpoint(
+    policy_number: str,
+    db: AsyncSession = Depends(get_db),
+    staff: dict = Depends(require_staff),
+    tenant_id: str = Depends(get_tenant_id),
+):
+    """Delete a policy and all associated data."""
+    result = await db.execute(
+        select(Document).where(
+            Document.policy_number == policy_number,
+            Document.tenant_id == tenant_id,
+            Document.document_type == DocumentType.POLICY,
+        )
+    )
+    doc = result.scalar_one_or_none()
+    if not doc:
+        raise HTTPException(status_code=404, detail="Policy not found")
+
+    # Delete chunks from Pinecone
+    chunk_result = await db.execute(
+        select(DocumentChunk).where(DocumentChunk.document_id == doc.id)
+    )
+    chunks = chunk_result.scalars().all()
+    chunk_ids = [c.pinecone_id for c in chunks if c.pinecone_id]
+
+    if chunk_ids:
+        try:
+            await get_retrieval_service().delete_document_vectors(tenant_id, chunk_ids)
+        except Exception as e:
+            logger.warning("Failed to delete vectors", error=str(e))
+
+    # Delete from storage
+    try:
+        await get_storage().delete_policy(tenant_id, policy_number)
+    except Exception as e:
+        logger.warning("Failed to delete from storage", error=str(e))
+
+    # Delete DB records
+    for chunk in chunks:
+        await db.delete(chunk)
+    await db.delete(doc)
+    await db.commit()
+
+    return PolicyDeleteResponse(
+        policy_number=policy_number,
+        status="deleted",
+    )
