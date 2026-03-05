@@ -1,6 +1,6 @@
 """Auth Service - Policyholder verification and staff authentication."""
 
-from sqlalchemy import select
+from sqlalchemy import select, func
 from sqlalchemy.ext.asyncio import AsyncSession
 import structlog
 
@@ -24,6 +24,7 @@ class AuthService:
     ) -> dict:
         """
         Verify a policyholder by Policy ID + Last Name or Company Name.
+        All matching is case-insensitive.
         Returns a session token if verified.
         """
         # Verify tenant exists
@@ -34,10 +35,10 @@ class AuthService:
         if not tenant:
             raise TenantNotFoundError(tenant_id)
 
-        # Build query
+        # Build query — case-insensitive policy number match
         query = select(Policyholder).where(
             Policyholder.tenant_id == tenant_id,
-            Policyholder.policy_number == policy_number,
+            func.lower(Policyholder.policy_number) == policy_number.strip().lower(),
             Policyholder.is_active == True,
         )
 
@@ -63,22 +64,25 @@ class AuthService:
             )
             raise PolicyholderVerificationError()
 
+        # Use the canonical policy number from DB (preserves original casing)
+        canonical_policy_number = holder.policy_number
+
         # Create session token
         token = create_policyholder_token(
             tenant_id=str(tenant_id),
-            policy_number=policy_number,
+            policy_number=canonical_policy_number,
         )
 
         logger.info(
             "Policyholder verified",
             tenant_id=tenant_id,
-            policy_number=policy_number,
+            policy_number=canonical_policy_number,
         )
 
         return {
             "verified": True,
             "token": token,
-            "policy_number": policy_number,
+            "policy_number": canonical_policy_number,
         }
 
     async def get_staff_user(self, db: AsyncSession, auth0_user_id: str) -> StaffUser | None:

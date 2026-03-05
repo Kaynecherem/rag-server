@@ -35,10 +35,14 @@ async def list_staff_query_history(
     base_filter = [QueryLog.tenant_id == tenant_id]
 
     if user_type:
-        try:
-            base_filter.append(QueryLog.user_type == UserRole(user_type))
-        except ValueError:
-            raise HTTPException(status_code=400, detail=f"Invalid user_type: {user_type}")
+        if user_type == "staff":
+            # "staff" filter matches both admin and staff roles
+            base_filter.append(QueryLog.user_type.in_([UserRole.STAFF, UserRole.ADMIN]))
+        else:
+            try:
+                base_filter.append(QueryLog.user_type == UserRole(user_type))
+            except ValueError:
+                raise HTTPException(status_code=400, detail=f"Invalid user_type: {user_type}")
 
     if document_type:
         try:
@@ -92,7 +96,10 @@ async def query_history_stats(
     )).scalar()
 
     staff_count = (await db.execute(
-        select(func.count(QueryLog.id)).where(*base, QueryLog.user_type == UserRole.STAFF)
+        select(func.count(QueryLog.id)).where(
+            *base,
+            QueryLog.user_type.in_([UserRole.STAFF, UserRole.ADMIN]),
+        )
     )).scalar()
 
     policyholder_count = (await db.execute(
@@ -200,6 +207,40 @@ async def list_policyholder_query_history(
         "page": page,
         "page_size": page_size,
     }
+
+
+# ── Policyholder: View a single query detail ──────────────────────────────
+
+@router.get("/policyholder/{query_id}")
+async def get_policyholder_query_detail(
+    query_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
+    tenant_id: str = Depends(get_tenant_id),
+):
+    """
+    Policyholder view: Get full detail for one of their own past queries.
+    Scoped to their policy number only.
+    """
+    if current_user.get("role") != "policyholder":
+        raise HTTPException(status_code=403, detail="This endpoint is for policyholders only")
+
+    policy_number = current_user.get("sub")
+    if not policy_number:
+        raise HTTPException(status_code=403, detail="No policy number in session")
+
+    result = await db.execute(
+        select(QueryLog).where(
+            QueryLog.id == query_id,
+            QueryLog.tenant_id == tenant_id,
+            QueryLog.policy_number == policy_number,
+        )
+    )
+    log = result.scalar_one_or_none()
+    if not log:
+        raise HTTPException(status_code=404, detail="Query not found")
+
+    return _format_query_log(log, include_full=True)
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────
