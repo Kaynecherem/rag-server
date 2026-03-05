@@ -139,6 +139,39 @@ async def query_history_stats(
 
 # ── Staff: View a single query detail ─────────────────────────────────────
 
+@router.get("/staff/conversation/{policy_number}")
+async def get_staff_conversation(
+    policy_number: str,
+    db: AsyncSession = Depends(get_db),
+    staff: dict = Depends(require_staff),
+    tenant_id: str = Depends(get_tenant_id),
+):
+    """
+    Staff view: Get all queries for a specific policy by the current user.
+    Returns full Q&A pairs ordered chronologically (oldest first).
+    Used to populate the conversation view when a policy is selected.
+    """
+    user_email = staff.get("email", "unknown")
+
+    result = await db.execute(
+        select(QueryLog)
+        .where(
+            QueryLog.tenant_id == tenant_id,
+            QueryLog.policy_number == policy_number,
+            QueryLog.user_identifier == user_email,
+            QueryLog.user_type.in_([UserRole.STAFF, UserRole.ADMIN]),
+        )
+        .order_by(QueryLog.queried_at.asc())
+    )
+    logs = result.scalars().all()
+
+    return {
+        "queries": [_format_query_log(log, include_full=True) for log in logs],
+        "total": len(logs),
+        "policy_number": policy_number,
+    }
+
+
 @router.get("/staff/{query_id}")
 async def get_query_detail(
     query_id: str,
@@ -206,6 +239,43 @@ async def list_policyholder_query_history(
         "total": total,
         "page": page,
         "page_size": page_size,
+    }
+
+
+# ── Policyholder: Get full conversation ───────────────────────────────────
+
+@router.get("/policyholder/conversation")
+async def get_policyholder_conversation(
+    db: AsyncSession = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
+    tenant_id: str = Depends(get_tenant_id),
+):
+    """
+    Policyholder view: Get all their queries for their policy, ordered chronologically.
+    Used to populate the conversation view.
+    """
+    if current_user.get("role") != "policyholder":
+        raise HTTPException(status_code=403, detail="This endpoint is for policyholders only")
+
+    policy_number = current_user.get("sub")
+    if not policy_number:
+        raise HTTPException(status_code=403, detail="No policy number in session")
+
+    result = await db.execute(
+        select(QueryLog)
+        .where(
+            QueryLog.tenant_id == tenant_id,
+            QueryLog.policy_number == policy_number,
+            QueryLog.user_type == UserRole.POLICYHOLDER,
+        )
+        .order_by(QueryLog.queried_at.asc())
+    )
+    logs = result.scalars().all()
+
+    return {
+        "queries": [_format_query_log(log, include_full=True) for log in logs],
+        "total": len(logs),
+        "policy_number": policy_number,
     }
 
 
