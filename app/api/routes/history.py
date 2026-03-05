@@ -335,8 +335,20 @@ def _format_query_log(log: QueryLog, include_full: bool = False) -> dict:
         data["retrieval_scores"] = log.retrieval_scores
 
     else:
-        # Truncated answer for list view
-        data["answer_preview"] = (log.answer or "")[:200]
+        # Truncated answer for list view — word-boundary truncation
+        data["answer_preview"] = _truncate_words(log.answer or "", max_chars=200)
         data["citation_count"] = len(log.citations) if log.citations else 0
 
     return data
+
+
+def _truncate_words(text: str, max_chars: int = 200) -> str:
+    """Truncate text at word boundary, adding ellipsis if needed."""
+    if len(text) <= max_chars:
+        return text
+    # Find the last space before the limit
+    truncated = text[:max_chars]
+    last_space = truncated.rfind(" ")
+    if last_space > max_chars // 2:
+        truncated = truncated[:last_space]
+    return truncated.rstrip(".,;:!? ") + "..."
