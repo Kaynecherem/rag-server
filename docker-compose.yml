@@ -1,3 +1,15 @@
+# ═══════════════════════════════════════════════════════════════════
+# Insurance RAG — Main App (updated with shared network)
+# ═══════════════════════════════════════════════════════════════════
+#
+# Changes from your original:
+#   - Added "networks: insurance-rag-network" to db, api, worker, redis
+#   - Added external network definition at the bottom
+#
+# Before starting, create the shared network once:
+#   docker network create insurance-rag-network
+# ═══════════════════════════════════════════════════════════════════
+
 services:
   # ── API Server ──────────────────────────────────────────────────────────
   api:
@@ -11,9 +23,11 @@ services:
       redis:
         condition: service_started
     volumes:
-      - ./app:/app/app  # Hot reload in dev
-      - localstorage:/app/storage  # Local file storage (dev mode)
+      - ./app:/app/app
+      - localstorage:/app/storage
     command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+    networks:
+      - insurance-rag-network
 
   # ── Celery Worker (async processing) ────────────────────────────────────
   worker:
@@ -25,6 +39,8 @@ services:
       redis:
         condition: service_started
     command: celery -A app.worker worker --loglevel=info --concurrency=2
+    networks:
+      - insurance-rag-network
 
   # ── PostgreSQL ──────────────────────────────────────────────────────────
   db:
@@ -42,6 +58,8 @@ services:
       interval: 5s
       timeout: 5s
       retries: 5
+    networks:
+      - insurance-rag-network
 
   # ── Redis ───────────────────────────────────────────────────────────────
   redis:
@@ -50,8 +68,14 @@ services:
       - "6379:6379"
     volumes:
       - redisdata:/data
+    networks:
+      - insurance-rag-network
 
 volumes:
   pgdata:
   redisdata:
   localstorage:
+
+networks:
+  insurance-rag-network:
+    external: true

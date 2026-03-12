@@ -11,7 +11,7 @@ class Settings(BaseSettings):
     app_name: str = "insurance-rag"
     app_env: str = "development"
     debug: bool = True
-    secret_key: str = "change-this-to-a-random-secret-key"
+    secret_key: str = "ins-rag-9f2k4j7m3x8b1v5n6p0w2q4r7t9y1u3"
 
     # Database
     database_url: str = "postgresql+asyncpg://postgres:postgres@localhost:5432/insurance_rag"

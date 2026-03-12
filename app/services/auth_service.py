@@ -15,17 +15,16 @@ class AuthService:
     """Handles authentication for both policyholders and staff."""
 
     async def verify_policyholder(
-        self,
-        db: AsyncSession,
-        tenant_id: str,
-        policy_number: str,
-        last_name: str | None = None,
-        company_name: str | None = None,
-    ) -> dict:
+            self, db, tenant_id: str, policy_number: str,
+            last_name: str = None, company_name: str = None,
+    ):
         """
         Verify a policyholder by Policy ID + Last Name or Company Name.
         All matching is case-insensitive.
-        Returns a session token if verified.
+
+        Returns a dict with token on success.
+        Raises PolicyholderVerificationError on not found.
+        Returns a dict with error_code="inactive" if the policyholder is deactivated.
         """
         # Verify tenant exists
         tenant = await db.execute(
@@ -35,27 +34,25 @@ class AuthService:
         if not tenant:
             raise TenantNotFoundError(tenant_id)
 
-        # Build query — case-insensitive policy number match
-        query = select(Policyholder).where(
-            Policyholder.tenant_id == tenant_id,
-            func.lower(Policyholder.policy_number) == policy_number.strip().lower(),
-            Policyholder.is_active == True,
-        )
-
-        if last_name:
-            query = query.where(
-                Policyholder.last_name.ilike(last_name.strip())
-            )
-        elif company_name:
-            query = query.where(
-                Policyholder.company_name.ilike(f"%{company_name.strip()}%")
-            )
-        else:
+        if not last_name and not company_name:
             raise PolicyholderVerificationError()
 
-        result = await db.execute(query)
+        # Step 1: Find the policyholder WITHOUT filtering by is_active
+        # so we can distinguish "doesn't exist" from "deactivated"
+        filters = [
+            Policyholder.tenant_id == tenant_id,
+            func.lower(Policyholder.policy_number) == policy_number.strip().lower(),
+        ]
+
+        if last_name:
+            filters.append(Policyholder.last_name.ilike(last_name.strip()))
+        elif company_name:
+            filters.append(Policyholder.company_name.ilike(f"%{company_name.strip()}%"))
+
+        result = await db.execute(select(Policyholder).where(*filters))
         holder = result.scalar_one_or_none()
 
+        # Step 2: Not found at all
         if not holder:
             logger.warning(
                 "Policyholder verification failed",
@@ -64,10 +61,22 @@ class AuthService:
             )
             raise PolicyholderVerificationError()
 
-        # Use the canonical policy number from DB (preserves original casing)
+        # Step 3: Found but deactivated — return a distinct response
+        # instead of raising, so the route can return a friendly message
+        if not holder.is_active:
+            logger.warning(
+                "Deactivated policyholder attempted login",
+                tenant_id=tenant_id,
+                policy_number=policy_number,
+            )
+            return {
+                "verified": False,
+                "error_code": "inactive",
+            }
+
+        # Step 4: Active — issue token
         canonical_policy_number = holder.policy_number
 
-        # Create session token
         token = create_policyholder_token(
             tenant_id=str(tenant_id),
             policy_number=canonical_policy_number,

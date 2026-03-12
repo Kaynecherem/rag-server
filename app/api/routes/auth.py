@@ -29,6 +29,9 @@ async def verify_policyholder(
 
     No account creation needed. Returns a session token valid for 24 hours.
     The token grants read-only access to the specified policy.
+
+    If the policyholder has been deactivated, returns a friendly 403 message
+    that guides them to contact their provider without revealing the deactivation.
     """
     result = await auth_service.verify_policyholder(
         db=db,
@@ -37,6 +40,17 @@ async def verify_policyholder(
         last_name=request.last_name,
         company_name=request.company_name,
     )
+
+    # Handle deactivated policyholder — friendly message, no reveal
+    if result.get("error_code") == "inactive":
+        raise HTTPException(
+            status_code=403,
+            detail=(
+                "We're unable to verify access for this policy at the moment. "
+                "Please contact your insurance provider for assistance — "
+                "they'll be happy to help you get connected."
+            ),
+        )
 
     return PolicyholderVerifyResponse(
         verified=result["verified"],

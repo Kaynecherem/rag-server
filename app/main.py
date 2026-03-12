@@ -20,14 +20,17 @@ from fastapi.middleware.cors import CORSMiddleware
 from app.config import get_settings
 from app.api.routes import policies, communications, query, auth, widget, batch_upload, history
 from app.db.session import engine, Base
+from app.api.routes.tenant_info import router as tenant_info_router
+from app.api.routes.admin_management import router as admin_mgmt_router
+
 
 # ── Hardening imports ────────────────────────────────────────────────
 from app.utils.logging import setup_logging
 from app.middleware.request_id import RequestIDMiddleware
 from app.middleware.logging_mw import RequestLoggingMiddleware
 from app.middleware.rate_limit import RateLimitMiddleware
+from app.middleware.tenant_guard import TenantGuardMiddleware
 from app.middleware.error_handler import register_exception_handlers
-
 
 settings = get_settings()
 
@@ -77,7 +80,14 @@ app.add_middleware(RequestIDMiddleware)
 # 2. Request logging - logs every request with timing
 app.add_middleware(RequestLoggingMiddleware)
 
-# 3. CORS
+# Tenant guard (checks suspension + usage limits)
+app.add_middleware(TenantGuardMiddleware)
+
+# 3. Rate limiting BEFORE CORS (so CORS wraps it)
+app.add_middleware(RateLimitMiddleware)
+
+# 4. CORS - LAST added = outermost = runs first
+#    This ensures ALL responses (including 429s) get CORS headers
 origins = settings.cors_origin_list
 app.add_middleware(
     CORSMiddleware,
@@ -88,7 +98,7 @@ app.add_middleware(
     expose_headers=["X-Request-ID", "X-RateLimit-Limit", "X-RateLimit-Remaining"],
 )
 
-# 4. Rate limiting (uses in-memory fallback if Redis unavailable)
+# Rate limiting (uses in-memory fallback if Redis unavailable)
 app.add_middleware(RateLimitMiddleware)
 
 # ── Exception handlers ───────────────────────────────────────────────
@@ -103,7 +113,8 @@ app.include_router(query.router, prefix="/api/v1", tags=["query"])
 app.include_router(widget.router, prefix="/widget", tags=["widget"])
 app.include_router(batch_upload.router, prefix="/api/v1", tags=["batch-upload"])
 app.include_router(history.router, prefix="/api/v1/history", tags=["history"])
-
+app.include_router(tenant_info_router, prefix="/api/v1/tenant", tags=["tenant-info"])
+app.include_router(admin_mgmt_router, prefix="/api/v1/admin", tags=["admin-management"])
 # ── Health Check ─────────────────────────────────────────────────────
 
 @app.get("/health")
