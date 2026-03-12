@@ -53,6 +53,7 @@ class Tenant(Base):
     slug = Column(String(100), unique=True, nullable=False, index=True)
     status = Column(SAEnum(TenantStatus), default=TenantStatus.TRIAL, nullable=False)
     widget_config = Column(JSON, default=dict)  # branding, colors, welcome msg
+    plan = Column(String(100), default="trial")
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 

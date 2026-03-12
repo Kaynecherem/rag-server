@@ -215,3 +215,41 @@ async def get_tenant_status(
         "status": tenant.status.value if hasattr(tenant.status, "value") else str(tenant.status),
         "plan": getattr(tenant, "plan", "trial") or "trial",
     }
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Current User Info — live from DB, for frontend role sync
+# ═══════════════════════════════════════════════════════════════════════════
+
+@router.get("/me")
+async def get_current_user_info(
+    current_user: dict = Depends(get_current_user),
+    tenant_id: str = Depends(get_tenant_id),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Returns the current user's role as it is in the database RIGHT NOW.
+    The frontend calls this on mount and periodically to detect:
+    - Role changes (admin → staff or vice versa)
+    - Plan changes
+    - Deactivation (handled by get_current_user raising 403)
+
+    If the role here differs from what's stored in localStorage,
+    the frontend updates localStorage and re-renders the sidebar.
+    """
+    result = await db.execute(select(Tenant).where(Tenant.id == tenant_id))
+    tenant = result.scalar_one_or_none()
+
+    plan = "trial"
+    if tenant:
+        plan = getattr(tenant, "plan", "trial") or "trial"
+
+    return {
+        "role": current_user.get("role"),
+        "email": current_user.get("email"),
+        "name": current_user.get("name"),
+        "staff_id": current_user.get("staff_id"),
+        "tenant_id": tenant_id,
+        "plan": plan,
+        "plan_name": PLAN_LIMITS.get(plan, PLAN_LIMITS["trial"])["name"],
+    }

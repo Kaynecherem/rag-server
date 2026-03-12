@@ -1,12 +1,10 @@
 """
 Tenant Admin Management routes — staff and policyholder CRUD for admin-role users.
 
-Allows admin-role staff within a tenant to manage their own staff and policyholders.
-This is DIFFERENT from the superadmin — these are scoped to the admin's own tenant.
+FIX 3: Admins cannot update or toggle their own records at all.
+       The check uses staff_id from the DB lookup (set by the updated dependencies.py).
 
-Register in main.py:
-    from app.api.routes.admin_management import router as admin_mgmt_router
-    app.include_router(admin_mgmt_router, prefix="/api/v1/admin", tags=["admin-management"])
+REPLACE your existing app/api/routes/admin_management.py with this file.
 """
 
 import logging
@@ -23,6 +21,12 @@ from app.models.database import StaffUser, Policyholder, UserRole
 
 logger = logging.getLogger("api.admin_management")
 router = APIRouter()
+
+
+def _is_self(admin: dict, staff_id: str) -> bool:
+    """Check if the admin is trying to modify their own record."""
+    # staff_id is set by the updated dependencies.py during DB validation
+    return admin.get("staff_id") == staff_id
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -65,6 +69,7 @@ async def list_staff(
                 "name": s.name,
                 "role": s.role.value if hasattr(s.role, "value") else str(s.role),
                 "is_active": s.is_active,
+                "is_self": _is_self(admin, str(s.id)),
                 "last_login_at": s.last_login_at.isoformat() if s.last_login_at else None,
                 "created_at": s.created_at.isoformat() if s.created_at else None,
             }
@@ -93,7 +98,6 @@ async def create_staff(
     if role not in ("admin", "staff"):
         raise HTTPException(status_code=400, detail="Role must be 'admin' or 'staff'")
 
-    # Check uniqueness
     existing = await db.execute(
         select(StaffUser).where(StaffUser.tenant_id == tenant_id, StaffUser.email == email)
     )
@@ -130,6 +134,13 @@ async def update_staff(
     db: AsyncSession = Depends(get_db),
 ):
     """Update a staff user in the admin's tenant."""
+    # Block self-edit entirely
+    if _is_self(admin, staff_id):
+        raise HTTPException(
+            status_code=403,
+            detail="You cannot modify your own account. Ask another administrator to make changes.",
+        )
+
     result = await db.execute(
         select(StaffUser).where(StaffUser.id == staff_id, StaffUser.tenant_id == tenant_id)
     )
@@ -137,15 +148,11 @@ async def update_staff(
     if not staff:
         raise HTTPException(status_code=404, detail="Staff user not found")
 
-    # Don't let admins demote themselves
-    if str(staff.id) == admin.get("sub") and body.get("role") == "staff":
-        raise HTTPException(status_code=400, detail="You cannot change your own role")
-
-    if "name" in body and body["name"]:
+    if "name" in body and body["name"] and body["name"].strip():
         staff.name = body["name"].strip()
     if "role" in body and body["role"] in ("admin", "staff"):
         staff.role = UserRole(body["role"])
-    if "email" in body and body["email"]:
+    if "email" in body and body["email"] and body["email"].strip():
         new_email = body["email"].lower().strip()
         dup = await db.execute(
             select(StaffUser).where(
@@ -177,16 +184,19 @@ async def toggle_staff_status(
     db: AsyncSession = Depends(get_db),
 ):
     """Activate or deactivate a staff user."""
+    # Block self-deactivation
+    if _is_self(admin, staff_id):
+        raise HTTPException(
+            status_code=403,
+            detail="You cannot deactivate your own account. Ask another administrator.",
+        )
+
     result = await db.execute(
         select(StaffUser).where(StaffUser.id == staff_id, StaffUser.tenant_id == tenant_id)
     )
     staff = result.scalar_one_or_none()
     if not staff:
         raise HTTPException(status_code=404, detail="Staff user not found")
-
-    # Don't let admins deactivate themselves
-    if str(staff.id) == admin.get("sub"):
-        raise HTTPException(status_code=400, detail="You cannot deactivate your own account")
 
     staff.is_active = body.get("is_active", not staff.is_active)
     await db.commit()
@@ -263,12 +273,10 @@ async def create_policyholder(
     if not last_name and not company_name:
         raise HTTPException(status_code=400, detail="At least one of last name or company name is required")
 
-    # Check for duplicates
-    from sqlalchemy import func as sqlfunc
     existing = await db.execute(
         select(Policyholder).where(
             Policyholder.tenant_id == tenant_id,
-            sqlfunc.lower(Policyholder.policy_number) == policy_number.lower(),
+            func.lower(Policyholder.policy_number) == policy_number.lower(),
         )
     )
     if existing.scalar_one_or_none():
