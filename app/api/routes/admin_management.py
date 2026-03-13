@@ -19,6 +19,8 @@ from app.db.session import get_db
 from app.api.dependencies import require_admin, get_tenant_id
 from app.models.database import StaffUser, Policyholder, UserRole
 
+from app.services.auth0_mgmt import Auth0ManagementService
+
 logger = logging.getLogger("api.admin_management")
 router = APIRouter()
 
@@ -103,13 +105,16 @@ async def create_staff(
     )
     if existing.scalar_one_or_none():
         raise HTTPException(status_code=409, detail=f"Staff with email '{email}' already exists")
+    # Auto-create user in Auth0
+    auth0_svc = Auth0ManagementService()
+    auth0_result = await auth0_svc.create_user(email=email, name=name)
 
     staff = StaffUser(
         tenant_id=tenant_id,
         email=email,
         name=name,
         role=UserRole(role),
-        auth0_user_id=f"pending|{uuid.uuid4().hex[:24]}",
+        auth0_user_id=auth0_result["auth0_user_id"],
         is_active=True,
     )
     db.add(staff)

@@ -64,6 +64,10 @@ class Settings(BaseSettings):
     # CORS
     cors_origins: str = "http://localhost:3000,http://localhost:8000"
 
+    # Auth0 Management API (auto-create users)
+    auth0_mgmt_client_id: str = ""
+    auth0_mgmt_client_secret: str = ""
+
     # RAG Config
     chunk_size: int = 512
     chunk_overlap: int = 128
