@@ -155,7 +155,6 @@ async def staff_auth0_login(
 # ═══════════════════════════════════════════════════════════════════════════
 # Policyholder Verification (unchanged)
 # ═══════════════════════════════════════════════════════════════════════════
-
 @router.post("/verify-policyholder", response_model=PolicyholderVerifyResponse)
 async def verify_policyholder(
     request: PolicyholderVerifyRequest,
@@ -163,17 +162,30 @@ async def verify_policyholder(
 ):
     """
     Verify a policyholder's identity using Policy ID + Last Name or Company Name.
-    Returns a session token valid for 24 hours.
+    Accepts either tenant_id (UUID) or slug (from subdomain) to identify the tenant.
     """
+    # Resolve tenant_id from slug if needed
+    tenant_id = request.tenant_id
+    if not tenant_id and request.slug:
+        result = await db.execute(
+            select(Tenant).where(Tenant.slug == request.slug.lower().strip())
+        )
+        tenant = result.scalar_one_or_none()
+        if not tenant:
+            raise HTTPException(status_code=404, detail="Agency not found")
+        tenant_id = str(tenant.id)
+
+    if not tenant_id:
+        raise HTTPException(status_code=400, detail="Either tenant_id or slug is required")
+
     result = await auth_service.verify_policyholder(
         db=db,
-        tenant_id=request.tenant_id,
+        tenant_id=tenant_id,
         policy_number=request.policy_number,
         last_name=request.last_name,
         company_name=request.company_name,
     )
 
-    # Handle deactivated policyholder
     if result.get("error_code") == "inactive":
         raise HTTPException(
             status_code=403,
@@ -191,8 +203,6 @@ async def verify_policyholder(
         expires_at=datetime.utcnow() + timedelta(hours=24),
         message="Verification successful. You can now query your policy.",
     )
-
-
 # ═══════════════════════════════════════════════════════════════════════════
 # Test Setup (DEV ONLY — kept for seeding data, not used by login page)
 # ═══════════════════════════════════════════════════════════════════════════

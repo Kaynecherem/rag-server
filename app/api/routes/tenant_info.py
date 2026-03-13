@@ -52,6 +52,46 @@ PLAN_LIMITS = {
     },
 }
 
+# ═══════════════════════════════════════════════════════════════════════════
+# Tenant Lookup by Slug (for subdomain resolution)
+# ═══════════════════════════════════════════════════════════════════════════
+
+@router.get("/by-slug/{slug}")
+async def get_tenant_by_slug(
+    slug: str,
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Public endpoint — returns tenant public info by slug.
+    Used by the frontend to resolve a subdomain to a tenant.
+    No auth required.
+    """
+    result = await db.execute(
+        select(Tenant).where(Tenant.slug == slug.lower().strip())
+    )
+    tenant = result.scalar_one_or_none()
+
+    if not tenant:
+        raise HTTPException(status_code=404, detail="Agency not found")
+
+    status_val = tenant.status.value if hasattr(tenant.status, "value") else str(tenant.status)
+
+    if status_val.upper() == "SUSPENDED":
+        return {
+            "id": str(tenant.id),
+            "name": tenant.name,
+            "slug": tenant.slug,
+            "status": "suspended",
+        }
+
+    return {
+        "id": str(tenant.id),
+        "name": tenant.name,
+        "slug": tenant.slug,
+        "status": status_val.lower(),
+        "plan": tenant.plan or "trial",
+        "widget_config": tenant.widget_config or {},
+    }
 
 # ═══════════════════════════════════════════════════════════════════════════
 # Notifications (FIX 1 — raw SQL, no model dependency)

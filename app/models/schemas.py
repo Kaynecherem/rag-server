@@ -95,10 +95,11 @@ class CommunicationQueryRequest(BaseModel):
 
 class PolicyholderVerifyRequest(BaseModel):
     """Policyholder verifies identity with policy ID + last name or company name."""
-    tenant_id: str
-    policy_number: str = Field(..., min_length=1)
-    last_name: str | None = None
-    company_name: str | None = None
+    tenant_id: Optional[str] = None  # Changed from required to optional
+    slug: Optional[str] = None  # NEW — alternative to tenant_id
+    policy_number: str
+    last_name: Optional[str] = None
+    company_name: Optional[str] = None
 
     def model_post_init(self, __context):
         if not self.last_name and not self.company_name:
