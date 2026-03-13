@@ -1,0 +1,89 @@
+name: Deploy Client Backend
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  EC2_HOST:    ${{ secrets.EC2_HOST }}
+  REMOTE_DIR:  /opt/insurance-rag/client-backend
+  SERVICE:     api
+
+jobs:
+  deploy:
+    name: Deploy to EC2
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup SSH key
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.EC2_SSH_KEY }}" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          ssh-keyscan -H $EC2_HOST >> ~/.ssh/known_hosts 2>/dev/null
+
+      - name: Sync code to EC2
+        run: |
+          rsync -avz --delete \
+            --exclude '.git' \
+            --exclude '__pycache__' \
+            --exclude '.env' \
+            --exclude 'venv' \
+            --exclude '.venv' \
+            --exclude '*.pyc' \
+            --exclude '.pytest_cache' \
+            -e "ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=no" \
+            . ec2-user@$EC2_HOST:$REMOTE_DIR/
+
+      - name: Rebuild and restart service
+        run: |
+          ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=no ec2-user@$EC2_HOST << 'REMOTE'
+            set -e
+            cd /opt/insurance-rag
+
+            echo "── Rebuilding api service ──"
+            docker compose build api
+            docker compose up -d api
+
+            echo "── Running migrations ──"
+            docker compose exec -T api alembic upgrade head 2>/dev/null || echo "No migrations or alembic not configured"
+
+            echo "── Health check ──"
+            for i in 1 2 3 4 5; do
+              if curl -sf http://localhost/health > /dev/null 2>&1; then
+                echo "✓ API healthy"
+                exit 0
+              fi
+              echo "  Attempt $i/5 — waiting..."
+              sleep 5
+            done
+
+            echo "✗ Health check failed"
+            docker compose logs api --tail 20
+            exit 1
+          REMOTE
+
+      - name: Invalidate CloudFront cache
+        if: success()
+        env:
+          AWS_ACCESS_KEY_ID:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION:    us-east-1
+        run: |
+          aws cloudfront create-invalidation \
+            --distribution-id ${{ secrets.CLOUDFRONT_DIST_ID }} \
+            --paths "/*" \
+            --query 'Invalidation.Id' \
+            --output text
+
+      - name: Cleanup SSH key
+        if: always()
+        run: rm -f ~/.ssh/deploy_key
