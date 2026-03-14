@@ -121,13 +121,20 @@ async def create_staff(
     await db.commit()
     await db.refresh(staff)
 
-    return {
+    # After db.commit() and db.refresh(staff):
+    response = {
         "id": str(staff.id),
         "email": staff.email,
         "name": staff.name,
         "role": role,
         "is_active": True,
     }
+
+    if auth0_result.get("password_reset_url"):
+        response["password_reset_url"] = auth0_result["password_reset_url"]
+    response["auth0_auto_created"] = auth0_result.get("auto_created", False)
+
+    return response
 
 
 @router.put("/staff/{staff_id}")
@@ -372,3 +379,53 @@ async def toggle_policyholder_status(
     await db.commit()
 
     return {"id": str(ph.id), "policy_number": ph.policy_number, "is_active": ph.is_active}
+
+@router.post("/staff/{staff_id}/reset-password")
+async def reset_staff_password(
+    staff_id: str,
+    admin: dict = Depends(require_admin),
+    tenant_id: str = Depends(get_tenant_id),
+    db: AsyncSession = Depends(get_db),
+):
+    """Generate a new password reset link for an existing staff user."""
+    result = await db.execute(
+        select(StaffUser).where(StaffUser.id == staff_id, StaffUser.tenant_id == tenant_id)
+    )
+    staff = result.scalar_one_or_none()
+    if not staff:
+        raise HTTPException(status_code=404, detail="Staff user not found")
+
+    if not staff.is_active:
+        raise HTTPException(status_code=400, detail="Cannot reset password for inactive user")
+
+    if staff.auth0_user_id.startswith("pending|"):
+        raise HTTPException(status_code=400, detail="User has not been provisioned in Auth0 yet")
+
+    from app.services.auth0_mgmt import Auth0ManagementService
+    import httpx
+
+    auth0_svc = Auth0ManagementService()
+    token = await auth0_svc._get_mgmt_token()
+    if not token:
+        raise HTTPException(status_code=500, detail="Auth0 Management API unavailable")
+
+    async with httpx.AsyncClient() as client:
+        ticket_resp = await client.post(
+            f"https://{auth0_svc.domain}/api/v2/tickets/password-change",
+            headers={"Authorization": f"Bearer {token}"},
+            json={
+                "user_id": staff.auth0_user_id,
+                "result_url": "https://agencylensai.com/auth",
+                "ttl_sec": 604800,
+            },
+            timeout=10,
+        )
+
+    if ticket_resp.status_code != 201:
+        raise HTTPException(status_code=500, detail="Failed to generate password reset link")
+
+    return {
+        "password_reset_url": ticket_resp.json().get("ticket"),
+        "email": staff.email,
+        "message": f"Password reset link generated for {staff.email}. Valid for 7 days.",
+    }
