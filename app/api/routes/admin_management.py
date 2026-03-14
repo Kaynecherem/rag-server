@@ -12,7 +12,7 @@ import uuid
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
-from sqlalchemy import select, func, desc
+from sqlalchemy import select, func, desc, asc
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db.session import get_db
@@ -43,9 +43,17 @@ async def list_staff(
     admin: dict = Depends(require_admin),
     tenant_id: str = Depends(get_tenant_id),
     db: AsyncSession = Depends(get_db),
+    show_deleted: bool = Query(False, description="Show only deleted users"),
+    sort_by: str = Query("name", pattern=r"^(name|email|role|created_at|last_login_at)$"),
+    sort_order: str = Query("asc", pattern=r"^(asc|desc)$"),
 ):
     """List staff users in the admin's tenant."""
     filters = [StaffUser.tenant_id == tenant_id]
+    if show_deleted:
+        filters.append(StaffUser.deleted_at.isnot(None))
+    else:
+        filters.append(StaffUser.deleted_at.is_(None))
+
     if search:
         filters.append(
             (StaffUser.email.ilike(f"%{search}%")) | (StaffUser.name.ilike(f"%{search}%"))
@@ -53,13 +61,20 @@ async def list_staff(
 
     total = (await db.execute(select(func.count(StaffUser.id)).where(*filters))).scalar() or 0
 
+    sort_column = getattr(StaffUser, sort_by, StaffUser.name)
+    if sort_order == "asc":
+        order_clause = sort_column.asc().nullslast()
+    else:
+        order_clause = sort_column.desc().nullslast()
+
     query = (
         select(StaffUser)
         .where(*filters)
-        .order_by(desc(StaffUser.created_at))
+        .order_by(order_clause)
         .offset((page - 1) * page_size)
         .limit(page_size)
     )
+
     result = await db.execute(query)
     staff_list = result.scalars().all()
 
