@@ -71,6 +71,32 @@ async def list_staff_query_history(
     result = await db.execute(query)
     logs = result.scalars().all()
 
+    # Resolve staff emails to full names
+    staff_emails = list(set(
+        log.user_identifier for log in logs
+        if log.user_type in (UserRole.STAFF, UserRole.ADMIN)
+    ))
+
+    name_map = {}
+    if staff_emails:
+        from app.models.database import StaffUser
+        name_result = await db.execute(
+            select(StaffUser.email, StaffUser.name, StaffUser.deleted_name, StaffUser.deleted_at)
+            .where(
+                StaffUser.tenant_id == tenant_id,
+                StaffUser.email.in_(staff_emails),
+            )
+        )
+        for row in name_result.all():
+            if row.deleted_at and row.deleted_name:
+                name_map[row.email] = f"{row.deleted_name} (Deleted User)"
+            elif row.name:
+                name_map[row.email] = row.name
+
+    # Attach display names to logs
+    for log in logs:
+        log._display_name = name_map.get(log.user_identifier, log.user_identifier)
+
     return {
         "queries": [_format_query_log(log) for log in logs],
         "total": total,
@@ -321,6 +347,7 @@ def _format_query_log(log: QueryLog, include_full: bool = False) -> dict:
         "id": str(log.id),
         "user_type": log.user_type.value if log.user_type else None,
         "user_identifier": log.user_identifier,
+        "user_display_name": getattr(log, "_display_name", log.user_identifier),  # ADD THIS
         "policy_number": log.policy_number,
         "document_type": log.document_type.value if log.document_type else None,
         "question": log.question,
@@ -335,7 +362,6 @@ def _format_query_log(log: QueryLog, include_full: bool = False) -> dict:
         data["retrieval_scores"] = log.retrieval_scores
 
     else:
-        # Truncated answer for list view — word-boundary truncation
         data["answer_preview"] = _truncate_words(log.answer or "", max_chars=200)
         data["citation_count"] = len(log.citations) if log.citations else 0
 

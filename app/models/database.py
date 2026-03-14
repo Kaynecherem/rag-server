@@ -145,7 +145,8 @@ class StaffUser(Base):
     is_active = Column(Boolean, default=True)
     last_login_at = Column(DateTime, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
-
+    deleted_at = Column(DateTime, nullable=True)
+    deleted_name = Column(String(255), nullable=True)
     # Relationships
     tenant = relationship("Tenant", back_populates="staff_users")
 

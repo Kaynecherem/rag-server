@@ -262,3 +262,39 @@ class Auth0ManagementService:
             else:
                 logger.error(f"Failed to delete Auth0 user {auth0_user_id}: {resp.status_code}")
                 return False
+
+    async def update_user(self, auth0_user_id: str, name: str = None, email: str = None) -> bool:
+        """
+        Update a user's name and/or email in Auth0.
+        Returns True if successful.
+        """
+        if not self.enabled or auth0_user_id.startswith("pending|"):
+            return False
+
+        token = await self._get_mgmt_token()
+        if not token:
+            return False
+
+        update_data = {}
+        if name:
+            update_data["name"] = name
+        if email:
+            update_data["email"] = email.lower().strip()
+            update_data["email_verified"] = True  # Skip re-verification
+
+        if not update_data:
+            return True  # Nothing to update
+
+        async with httpx.AsyncClient() as client:
+            resp = await client.patch(
+                f"{self.base_url}/api/v2/users/{auth0_user_id}",
+                headers={"Authorization": f"Bearer {token}"},
+                json=update_data,
+                timeout=10,
+            )
+            if resp.status_code == 200:
+                logger.info(f"Auth0 user updated: {auth0_user_id} → {update_data}")
+                return True
+            else:
+                logger.error(f"Auth0 user update failed: {resp.status_code} {resp.text}")
+                return False

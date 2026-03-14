@@ -171,6 +171,16 @@ async def update_staff(
     await db.commit()
     await db.refresh(staff)
 
+    # Sync changes to Auth0
+    if not staff.auth0_user_id.startswith("pending|"):
+        from app.services.auth0_mgmt import Auth0ManagementService
+        auth0_svc = Auth0ManagementService()
+        await auth0_svc.update_user(
+            auth0_user_id=staff.auth0_user_id,
+            name=staff.name,
+            email=staff.email,
+        )
+
     return {
         "id": str(staff.id),
         "email": staff.email,
