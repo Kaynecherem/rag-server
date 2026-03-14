@@ -169,24 +169,46 @@ class Auth0ManagementService:
                 auth0_user_id = user_data["user_id"]
                 logger.info(f"Auth0 user created: {email} → {auth0_user_id}")
 
-                # Trigger password reset email so user can set their own password
+                # Send password reset email so user can set their own password
                 password_reset_url = None
                 if not password:
+                    # 1. Mark email as verified first (required for some Auth0 configs)
+                    await client.patch(
+                        f"{self.base_url}/api/v2/users/{auth0_user_id}",
+                        headers=headers,
+                        json={"email_verified": True},
+                        timeout=10,
+                    )
+
+                    # 2. Trigger Auth0's built-in password reset email
+                    reset_resp = await client.post(
+                        f"{self.base_url}/dbconnections/change_password",
+                        json={
+                            "client_id": self.client_id,
+                            "email": email.lower().strip(),
+                            "connection": "Username-Password-Authentication",
+                        },
+                        timeout=10,
+                    )
+                    if reset_resp.status_code == 200:
+                        logger.info(f"Password reset email sent to {email}")
+                    else:
+                        logger.warning(f"Failed to send password reset email: {reset_resp.text}")
+
+                    # 3. Also generate a ticket URL as backup (can be shared manually)
                     ticket_resp = await client.post(
                         f"{self.base_url}/api/v2/tickets/password-change",
                         headers=headers,
                         json={
                             "user_id": auth0_user_id,
-                            "result_url": f"https://agencylensai.com/auth",
+                            "result_url": "https://agencylensai.com/auth",
                             "mark_email_as_verified": True,
                         },
                         timeout=10,
                     )
                     if ticket_resp.status_code == 201:
                         password_reset_url = ticket_resp.json().get("ticket")
-                        logger.info(f"Password reset ticket created for {email}")
-                    else:
-                        logger.warning(f"Failed to create password reset ticket: {ticket_resp.text}")
+                        logger.info(f"Password reset ticket also created for {email}")
 
                 return {
                     "auth0_user_id": auth0_user_id,
