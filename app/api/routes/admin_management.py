@@ -8,6 +8,7 @@ REPLACE your existing app/api/routes/admin_management.py with this file.
 """
 
 import logging
+import httpx
 import uuid
 from typing import Optional
 
@@ -20,6 +21,8 @@ from app.api.dependencies import require_admin, get_tenant_id
 from app.models.database import StaffUser, Policyholder, UserRole
 
 from app.services.auth0_mgmt import Auth0ManagementService
+from app.services.auth0_mgmt import Auth0ManagementService
+
 
 logger = logging.getLogger("api.admin_management")
 router = APIRouter()
@@ -169,7 +172,11 @@ async def update_staff(
         )
 
     result = await db.execute(
-        select(StaffUser).where(StaffUser.id == staff_id, StaffUser.tenant_id == tenant_id)
+        select(StaffUser).where(
+            StaffUser.id == staff_id,
+            StaffUser.tenant_id == tenant_id,
+            StaffUser.deleted_at.is_(None),
+        )
     )
     staff = result.scalar_one_or_none()
     if not staff:
@@ -229,7 +236,11 @@ async def toggle_staff_status(
         )
 
     result = await db.execute(
-        select(StaffUser).where(StaffUser.id == staff_id, StaffUser.tenant_id == tenant_id)
+        select(StaffUser).where(
+            StaffUser.id == staff_id,
+            StaffUser.tenant_id == tenant_id,
+            StaffUser.deleted_at.is_(None),
+        )
     )
     staff = result.scalar_one_or_none()
     if not staff:
@@ -415,9 +426,6 @@ async def reset_staff_password(
 
     if staff.auth0_user_id.startswith("pending|"):
         raise HTTPException(status_code=400, detail="User has not been provisioned in Auth0 yet")
-
-    from app.services.auth0_mgmt import Auth0ManagementService
-    import httpx
 
     auth0_svc = Auth0ManagementService()
     token = await auth0_svc._get_mgmt_token()

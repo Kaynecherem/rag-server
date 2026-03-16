@@ -138,7 +138,7 @@ class StaffUser(Base):
 
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     tenant_id = Column(UUID(as_uuid=True), ForeignKey("tenants.id"), nullable=False)
-    auth0_user_id = Column(String(200), unique=True, nullable=False)
+    auth0_user_id = Column(String(200), nullable=False)  # removed unique=True
     email = Column(String(255), nullable=False)
     name = Column(String(255), nullable=True)
     role = Column(SAEnum(UserRole), default=UserRole.STAFF, nullable=False)
@@ -152,6 +152,7 @@ class StaffUser(Base):
 
     __table_args__ = (
         UniqueConstraint("tenant_id", "email", name="uq_staff_tenant_email"),
+        UniqueConstraint("tenant_id", "auth0_user_id", name="uq_staff_tenant_auth0"),
     )
 
 

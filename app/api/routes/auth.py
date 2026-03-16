@@ -1,6 +1,12 @@
 """
 Authentication routes — Auth0 staff login + policyholder verification.
 
+CHANGES (multi-tenant fix):
+  - staff-login now accepts optional tenant_id/slug for scoping
+  - If same email in multiple tenants and no scope → 409 with tenant list
+  - Login query excludes soft-deleted staff (deleted_at IS NOT NULL)
+  - Auth0 user linking is per-tenant (no global unique)
+
 Auth0 flow:
 1. Frontend opens Auth0 login popup via @auth0/auth0-react SDK
 2. User authenticates with Auth0 (email/password, Google SSO, etc.)
@@ -12,18 +18,21 @@ Policyholder flow (unchanged):
 1. Frontend calls POST /api/v1/auth/verify-policyholder
 2. Backend verifies policy_number + last_name/company_name
 3. Returns a session token
+
+REPLACE: app/api/routes/auth.py
 """
 
 import uuid
 import logging
 from datetime import datetime, timedelta
+from typing import Optional, List
 
 import httpx
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
-from typing import Optional
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import selectinload
 
 from app.config import get_settings
 from app.db.session import get_db
@@ -45,6 +54,8 @@ logger = logging.getLogger("api.auth")
 class Auth0StaffLoginRequest(BaseModel):
     access_token: str
     email: Optional[str] = None
+    tenant_id: Optional[str] = None
+    slug: Optional[str] = None
 
 
 @router.post("/staff-login")
@@ -55,8 +66,10 @@ async def staff_auth0_login(
     """
     Exchange an Auth0 access token for our own staff JWT.
 
-    Verifies the Auth0 token, looks up the staff user by email,
-    checks active status and returns a JWT with the current DB role.
+    Multi-tenant handling:
+    - Single tenant match → login succeeds immediately.
+    - Multiple tenants + tenant_id/slug provided → scoped lookup.
+    - Multiple tenants + no scope → 409 with tenant list for frontend picker.
     """
     # Step 1: Verify the Auth0 token
     auth0_claims = verify_auth0_token(body.access_token)
@@ -68,7 +81,7 @@ async def staff_auth0_login(
         email = auth0_claims.get("email")
         auth0_sub = auth0_claims.get("sub")
     else:
-        # Token might be opaque or missing custom claims — fetch userinfo
+        # Token might be opaque — fetch userinfo
         try:
             resp = httpx.get(
                 f"https://{settings.auth0_domain}/userinfo",
@@ -96,13 +109,37 @@ async def staff_auth0_login(
 
     email = email.lower().strip()
 
-    # Step 2: Look up staff user by email
-    result = await db.execute(
-        select(StaffUser).where(StaffUser.email == email)
-    )
-    staff = result.scalar_one_or_none()
+    # Step 2: Resolve tenant scope if provided
+    scoped_tenant_id = None
 
-    if not staff:
+    if body.tenant_id:
+        scoped_tenant_id = body.tenant_id
+    elif body.slug:
+        tenant_result = await db.execute(
+            select(Tenant).where(Tenant.slug == body.slug.lower().strip())
+        )
+        tenant = tenant_result.scalar_one_or_none()
+        if tenant:
+            scoped_tenant_id = str(tenant.id)
+
+    # Step 3: Look up staff — EXCLUDE soft-deleted
+    filters = [
+        StaffUser.email == email,
+        StaffUser.deleted_at.is_(None),
+    ]
+
+    if scoped_tenant_id:
+        filters.append(StaffUser.tenant_id == scoped_tenant_id)
+
+    result = await db.execute(
+        select(StaffUser)
+        .where(*filters)
+        .options(selectinload(StaffUser.tenant))
+    )
+    staff_matches: List[StaffUser] = list(result.scalars().all())
+
+    # No matches
+    if not staff_matches:
         raise HTTPException(
             status_code=403,
             detail=(
@@ -110,6 +147,47 @@ async def staff_auth0_login(
                 "Please contact your agency administrator to set up your account."
             ),
         )
+
+    # Multiple tenants, no scope → ask frontend to pick
+    if len(staff_matches) > 1 and not scoped_tenant_id:
+        tenant_options = []
+        for s in staff_matches:
+            if s.is_active and s.tenant:
+                tenant_options.append({
+                    "tenant_id": str(s.tenant_id),
+                    "tenant_name": s.tenant.name,
+                    "slug": s.tenant.slug,
+                    "role": s.role.value if hasattr(s.role, "value") else str(s.role),
+                })
+
+        if not tenant_options:
+            raise HTTPException(
+                status_code=403,
+                detail=(
+                    "Your account has been deactivated in all agencies. "
+                    "Please contact your agency administrator for assistance."
+                ),
+            )
+
+        # If only one is active, just use it
+        if len(tenant_options) == 1:
+            scoped_tenant_id = tenant_options[0]["tenant_id"]
+            staff_matches = [
+                s for s in staff_matches
+                if str(s.tenant_id) == scoped_tenant_id
+            ]
+        else:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "error": "multiple_tenants",
+                    "message": "Your email is associated with multiple agencies. Please select one.",
+                    "tenants": tenant_options,
+                },
+            )
+
+    # Single match (or scoped)
+    staff = staff_matches[0]
 
     if not staff.is_active:
         raise HTTPException(
@@ -120,19 +198,19 @@ async def staff_auth0_login(
             ),
         )
 
-    # Step 3: Link Auth0 user ID on first login
+    # Step 4: Link Auth0 user ID on first login (per-tenant)
     if auth0_sub and (
         not staff.auth0_user_id
         or staff.auth0_user_id.startswith("pending|")
         or staff.auth0_user_id.startswith("test|")
     ):
         staff.auth0_user_id = auth0_sub
-        logger.info(f"Linked Auth0 user {auth0_sub} to staff {staff.email}")
+        logger.info(f"Linked Auth0 user {auth0_sub} to staff {staff.email} in tenant {staff.tenant_id}")
 
     staff.last_login_at = datetime.utcnow()
     await db.commit()
 
-    # Step 4: Create our own JWT
+    # Step 5: Create our own JWT
     token = create_staff_token(
         tenant_id=str(staff.tenant_id),
         user_id=str(staff.id),
@@ -140,7 +218,7 @@ async def staff_auth0_login(
         role=staff.role.value if hasattr(staff.role, "value") else str(staff.role),
     )
 
-    logger.info(f"Staff Auth0 login: {staff.email} ({staff.role})")
+    logger.info(f"Staff Auth0 login: {staff.email} ({staff.role}) → tenant {staff.tenant_id}")
 
     return {
         "token": token,
@@ -191,98 +269,18 @@ async def verify_policyholder(
             status_code=403,
             detail=(
                 "We're unable to verify access for this policy at the moment. "
-                "Please contact your insurance provider for assistance — "
-                "they'll be happy to help you get connected."
+                "Please contact your insurance provider for assistance."
             ),
         )
 
+    if not result.get("verified"):
+        raise HTTPException(
+            status_code=401,
+            detail="Verification failed. Please check your Policy ID and last name or company name.",
+        )
+
     return PolicyholderVerifyResponse(
-        verified=result["verified"],
+        verified=True,
         token=result["token"],
         policy_number=result["policy_number"],
-        expires_at=datetime.utcnow() + timedelta(hours=24),
-        message="Verification successful. You can now query your policy.",
     )
-# ═══════════════════════════════════════════════════════════════════════════
-# Test Setup (DEV ONLY — kept for seeding data, not used by login page)
-# ═══════════════════════════════════════════════════════════════════════════
-
-@router.post("/test-setup")
-async def test_setup(db: AsyncSession = Depends(get_db)):
-    """
-    DEV ONLY: Create a test tenant, staff user, and sample policyholders.
-    Disabled in production. No longer used by the login page — Auth0 handles
-    staff login now. This is kept for seeding test data via scripts.
-    """
-    if not settings.debug:
-        raise HTTPException(status_code=403, detail="Only available in development mode")
-
-    result = await db.execute(select(Tenant).where(Tenant.slug == "sunshine-insurance"))
-    existing = result.scalar_one_or_none()
-
-    if existing:
-        tenant = existing
-    else:
-        tenant = Tenant(
-            name="Sunshine Insurance Group",
-            slug="sunshine-insurance",
-            status=TenantStatus.ACTIVE,
-            widget_config={
-                "theme": {"primary": "#1B4F72", "accent": "#F39C12"},
-                "welcome_message": "Welcome to Sunshine Insurance! Ask anything about your policy.",
-            },
-        )
-        db.add(tenant)
-        await db.flush()
-
-    tenant_id = str(tenant.id)
-
-    result = await db.execute(
-        select(StaffUser).where(StaffUser.tenant_id == tenant.id, StaffUser.email == "admin@sunshine.test")
-    )
-    if not result.scalar_one_or_none():
-        staff = StaffUser(
-            tenant_id=tenant.id,
-            auth0_user_id=f"test|{uuid.uuid4().hex[:12]}",
-            email="admin@sunshine.test",
-            name="Test Admin",
-            role=UserRole.ADMIN,
-        )
-        db.add(staff)
-
-    policyholders_data = [
-        {"policy_number": "POL-2024-HO-001", "last_name": "Smith", "company_name": None},
-        {"policy_number": "POL-2024-AU-002", "last_name": "Rodriguez", "company_name": None},
-        {"policy_number": "POL-2024-CGL-003", "last_name": None, "company_name": "Springfield Hardware & Supply"},
-    ]
-
-    for ph_data in policyholders_data:
-        result = await db.execute(
-            select(Policyholder).where(
-                Policyholder.tenant_id == tenant.id,
-                Policyholder.policy_number == ph_data["policy_number"],
-            )
-        )
-        if not result.scalar_one_or_none():
-            db.add(Policyholder(tenant_id=tenant.id, **ph_data))
-
-    await db.flush()
-
-    staff_token = create_staff_token(
-        tenant_id=tenant_id,
-        user_id=f"test-admin-{tenant_id[:8]}",
-        email="admin@sunshine.test",
-        role="admin",
-    )
-
-    return {
-        "tenant_id": tenant_id,
-        "tenant_name": "Sunshine Insurance Group",
-        "staff_token": staff_token,
-        "message": "Test data seeded. Staff login now uses Auth0.",
-        "sample_policyholders": [
-            {"policy": "POL-2024-HO-001", "verify_with": "last_name: Smith"},
-            {"policy": "POL-2024-AU-002", "verify_with": "last_name: Rodriguez"},
-            {"policy": "POL-2024-CGL-003", "verify_with": "company_name: Springfield Hardware & Supply"},
-        ],
-    }
