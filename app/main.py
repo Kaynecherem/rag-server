@@ -92,14 +92,12 @@ origins = settings.cors_origin_list
 app.add_middleware(
     CORSMiddleware,
     allow_origins=origins,
+    allow_origin_regex=settings.cors_origin_regex or None,
     allow_credentials="*" not in origins,
     allow_methods=["*"],
     allow_headers=["*"],
     expose_headers=["X-Request-ID", "X-RateLimit-Limit", "X-RateLimit-Remaining"],
 )
-
-# Rate limiting (uses in-memory fallback if Redis unavailable)
-app.add_middleware(RateLimitMiddleware)
 
 # ── Exception handlers ───────────────────────────────────────────────
 register_exception_handlers(app)

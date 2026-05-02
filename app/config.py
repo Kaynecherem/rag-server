@@ -63,6 +63,7 @@ class Settings(BaseSettings):
 
     # CORS
     cors_origins: str = "http://localhost:3000,http://localhost:8000"
+    cors_origin_regex: str = ""
 
     # Auth0 Management API (auto-create users)
     auth0_mgmt_client_id: str = ""
