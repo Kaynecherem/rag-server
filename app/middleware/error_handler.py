@@ -10,11 +10,25 @@ from fastapi.responses import JSONResponse
 from fastapi.exceptions import RequestValidationError
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
+from app.core.exceptions import RAGException
+
 logger = logging.getLogger("api.errors")
 
 
 def register_exception_handlers(app: FastAPI) -> None:
     """Register all exception handlers on the app."""
+
+    @app.exception_handler(RAGException)
+    async def rag_exception_handler(request: Request, exc: RAGException):
+        """Handle domain exceptions (PolicyholderVerificationError, TenantNotFoundError, etc.)."""
+        logger.warning(
+            f"{type(exc).__name__} on {request.method} {request.url.path}: {exc.message}",
+            extra={"path": request.url.path, "error_type": type(exc).__name__},
+        )
+        return JSONResponse(
+            status_code=exc.status_code,
+            content={"error": exc.message},
+        )
 
     @app.exception_handler(StarletteHTTPException)
     async def http_exception_handler(request: Request, exc: StarletteHTTPException):
