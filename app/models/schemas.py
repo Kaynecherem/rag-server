@@ -112,7 +112,7 @@ class PolicyholderVerifyResponse(BaseModel):
     token: str | None = None
     policy_number: str
     expires_at: datetime | None = None
-    message: str
+    message: str | None = None
 
 
 class StaffTokenResponse(BaseModel):
